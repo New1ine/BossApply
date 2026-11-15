@@ -7,8 +7,8 @@
 ### Windows
 
 ```powershell
-git clone <仓库地址>
-cd <仓库目录>
+git clone https://github.com/New1ine/BossApply.git
+cd BossApply
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
