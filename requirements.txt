@@ -1,0 +1,2 @@
+customtkinter>=5.2,<7
+qrcode[pil]>=8.2,<9
