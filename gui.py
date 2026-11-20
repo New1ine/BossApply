@@ -315,7 +315,7 @@ class Desktop(ctk.CTk):
 
         def job():
             try:
-                adb = AdbClient(cfg)
+                adb = AdbClient(cfg, stopped=cancelled)
                 endpoint = adb.pair_wifi_qr(name, password, cancelled)
                 try:
                     serial = adb.connect_paired_wifi(endpoint)
@@ -508,8 +508,10 @@ class Desktop(ctk.CTk):
             elif event[0] == 'qr_paired' and event[1] == self.qr_session:
                 self._hide_qr()
                 self._wifi_busy(False)
-                self._set_status("扫码配对成功，正在检测已连接手机…", "#188264")
-                self.detect()
+                self.wifi_tabs.set("配对码配对")
+                self._set_status("扫码配对成功，WiFi 尚未连接。请填写手机无线调试主页的 IP 地址和端口")
+                if event[2]:
+                    messagebox.showwarning("WiFi 自动连接未完成", event[2], parent=self)
             elif event[0] == 'qr_error' and event[1] == self.qr_session:
                 self._hide_qr()
                 self._wifi_busy(False)

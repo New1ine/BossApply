@@ -1,19 +1,29 @@
 """ADB interaction layer. No GUI dependencies."""
-import re
+import hashlib
 import ipaddress
+import os
+import re
 import secrets
-import string
 import shutil
 import socket
+import string
 import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
+class AdbTimeoutError(RuntimeError):
+    """ADB 命令在限定时间内没有完成。"""
+
+
 class AdbClient:
     DEFAULT_PORTS = tuple(range(5037, 5057))
+    WINDOWS_ADB_FILES = ('adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll')
+    WIFI_CONNECT_SERVICE = '_adb-tls-connect._tcp'
+
 
     def __init__(self, config, stopped=None):
         self.config = config
@@ -26,16 +36,14 @@ class AdbClient:
         self.paired_endpoint = None
         self.paired_guid = None
 
-    @staticmethod
-    def _find_binary(value):
+    @classmethod
+    def _find_binary(cls, value):
         if value and value != 'auto':
             return str(value)
 
-        roots = (
-            [Path(sys.executable).resolve().parent, Path(sys._MEIPASS)]
-            if getattr(sys, 'frozen', False)
-            else [Path(__file__).resolve().parents[1]]
-        )
+        bundle_root = Path(sys._MEIPASS) if getattr(sys, 'frozen', False) else None
+        roots = ([Path(sys.executable).resolve().parent, bundle_root] if bundle_root else
+                 [Path(__file__).resolve().parents[1]])
         name = 'adb.exe' if sys.platform == 'win32' else 'adb'
 
         platform_dir = 'platform-tools-windows' if sys.platform == 'win32' else 'platform-tools-linux'
@@ -43,9 +51,40 @@ class AdbClient:
             for candidate in (root / 'platform-tools' / name,
                               root / 'platform-tools' / platform_dir / name):
                 if candidate.is_file():
+                    if root == bundle_root and sys.platform == 'win32':
+                        return str(cls._cache_bundled_adb(candidate.parent))
                     return str(candidate)
 
         return shutil.which(name) or name
+
+    @classmethod
+    def _cache_bundled_adb(cls, source):
+        """Keep the Windows ADB server's executable and DLLs outside PyInstaller's temp dir."""
+        local_data = Path(os.environ.get('LOCALAPPDATA') or Path.home())
+        cache = local_data / 'BossApply' / 'adb'
+        digest = hashlib.sha256()
+        try:
+            files = {name: (source / name).read_bytes() for name in cls.WINDOWS_ADB_FILES}
+            for content in files.values():
+                digest.update(hashlib.sha256(content).digest())
+            target = cache / digest.hexdigest()
+            if not target.is_dir():
+                cache.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(dir=cache) as temp:
+                    staged = Path(temp) / 'platform-tools'
+                    staged.mkdir()
+                    for name, content in files.items():
+                        (staged / name).write_bytes(content)
+                    try:
+                        staged.rename(target)
+                    except FileExistsError:
+                        # Another instance has published this version first.
+                        pass
+            if not all((target / name).is_file() for name in files):
+                raise OSError('缓存目录中的 ADB 文件不完整')
+        except OSError as exc:
+            raise RuntimeError(f'无法准备内置 ADB（{cache}）：{exc}') from exc
+        return target / 'adb.exe'
 
     @staticmethod
     def _port_listening(port):
@@ -69,7 +108,7 @@ class AdbClient:
         except FileNotFoundError as exc:
             raise RuntimeError('找不到 ADB，请安装 Platform-Tools 或检查 ADB 路径') from exc
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f'ADB 命令超时（{timeout} 秒）') from exc
+            raise AdbTimeoutError(f'ADB 命令超时（{timeout} 秒）') from exc
         if proc.returncode:
             detail = (proc.stderr or proc.stdout).decode('utf-8', errors='replace').strip()
             raise RuntimeError('ADB 执行失败：' + (detail or str(proc.returncode)))
@@ -261,10 +300,10 @@ class AdbClient:
     @classmethod
     def _mdns_connect_endpoint(cls, raw, host, guid=None):
         for line in raw.decode('utf-8', errors='replace').splitlines():
-            if '_adb-tls-connect._tcp' not in line:
+            if cls.WIFI_CONNECT_SERVICE not in line:
                 continue
             instance = line.split()[0].split('._adb', 1)[0]
-            if guid and not (instance == guid or instance.startswith(guid + '-')):
+            if guid and not cls._matches_wifi_guid(instance, guid):
                 continue
             match = re.search(r'((?:\d{1,3}\.){3}\d{1,3}:\d{1,5})\b', line)
             if match:
@@ -276,32 +315,61 @@ class AdbClient:
                     return endpoint
         return None
 
-    def connect_paired_wifi(self, pair_endpoint, timeout=8):
-        """Try the advertised debugging port after pairing; caller can fall back to manual entry."""
+    @staticmethod
+    def _matches_wifi_guid(instance, guid):
+        return instance == guid or instance.startswith(guid + '-')
+
+    def connect_paired_wifi(self, pair_endpoint, timeout=12):
+        """Verify the paired phone's wireless transport or connect to its advertised port."""
         host = self._wifi_endpoint(pair_endpoint).rsplit(':', 1)[0]
         deadline = time.monotonic() + timeout
+        last_error = None
         while time.monotonic() < deadline:
-            raw = self._run_for_port(self.port, 'mdns', 'services', timeout=5)
-            endpoint = self._mdns_connect_endpoint(raw, host, self.paired_guid)
-            if endpoint:
-                return self.connect_wifi(endpoint)
+            self.check_stop()
+            try:
+                if self.paired_guid:
+                    raw = self._run_for_port(self.port, 'devices', '-l', timeout=3)
+                    for device in self._parse_devices(raw):
+                        serial = device['serial']
+                        instance, service, _ = serial.partition('.' + self.WIFI_CONNECT_SERVICE)
+                        if service and self._matches_wifi_guid(instance, self.paired_guid):
+                            self.serial = serial
+                            return serial
+                raw = self._run_for_port(self.port, 'mdns', 'services', timeout=3)
+                endpoint = self._mdns_connect_endpoint(raw, host, self.paired_guid)
+                if endpoint:
+                    return self._connect_wifi_endpoint(endpoint, timeout=3)
+            except RuntimeError as exc:
+                last_error = exc
             self.wait(0.8)
+        if last_error:
+            raise last_error
         return None
 
     def pair_wifi_qr(self, name, password, cancelled, timeout=90):
         """Wait for the scanned phone's mDNS pairing service, then pair."""
         self._ensure_server()
         deadline = time.monotonic() + timeout
+        discovery_timeout = None
         while time.monotonic() < deadline:
             if cancelled.is_set():
                 raise InterruptedError('已取消扫码配对')
-            raw = self._run_for_port(self.port, 'mdns', 'services', timeout=5)
-            endpoint = self._mdns_endpoint(raw, name, '_adb-tls-pairing._tcp')
-            if endpoint:
-                self._pair_wifi(endpoint, password)
-                return endpoint
+            try:
+                raw = self._run_for_port(self.port, 'mdns', 'services', timeout=5)
+            except AdbTimeoutError as exc:
+                discovery_timeout = exc
+            else:
+                discovery_timeout = None
+                endpoint = self._mdns_endpoint(raw, name, '_adb-tls-pairing._tcp')
+                if endpoint and not cancelled.is_set():
+                    self._pair_wifi(endpoint, password)
+                    return endpoint
             cancelled.wait(1)
-        raise RuntimeError('扫码后没有发现手机的配对服务。请检查手机与电脑是否在同一 WiFi，且网络允许局域网设备互访和 mDNS')
+        if cancelled.is_set():
+            raise InterruptedError('已取消扫码配对')
+        if discovery_timeout:
+            raise RuntimeError('ADB 服务发现超时。可切换到「配对码配对」直接配对') from discovery_timeout
+        raise RuntimeError('扫码后未发现手机的配对服务。请确认手机与电脑处于可互访的同一局域网，或使用「配对码配对」')
 
     def connect_wifi(self, address):
         """Connect to the phone's debugging port and verify ADB authorization."""
@@ -309,22 +377,27 @@ class AdbClient:
         self._ensure_server()
         try:
             raw = self._run_for_port(self.port, 'mdns', 'services', timeout=5)
-            advertised = self._mdns_endpoint_for_port(raw, '_adb-tls-connect._tcp',
+            advertised = self._mdns_endpoint_for_port(raw, self.WIFI_CONNECT_SERVICE,
                                                       endpoint.rsplit(':', 1)[1])
             if advertised:
                 endpoint = advertised
         except RuntimeError:
             pass
-        output = self._run_for_port(self.port, 'connect', endpoint, timeout=20,
+        self._connect_wifi_endpoint(endpoint)
+        return self.connect()
+
+    def _connect_wifi_endpoint(self, endpoint, timeout=20):
+        self.check_stop()
+        output = self._run_for_port(self.port, 'connect', endpoint, timeout=timeout,
                                     merge_output=True)
         message = output.decode('utf-8', errors='replace').strip().lower()
         if not (message.startswith('connected to ') or message.startswith('already connected to ')):
             raise RuntimeError('WiFi 连接失败：' + (message or '请检查调试地址和端口'))
-        devices = self._parse_devices(self._run_for_port(self.port, 'devices', '-l', timeout=10))
+        devices = self._parse_devices(self._run_for_port(self.port, 'devices', '-l', timeout=min(timeout, 10)))
         if endpoint not in [device['serial'] for device in devices]:
             raise RuntimeError('WiFi 设备尚未授权，请检查手机上的调试提示')
         self.serial = endpoint
-        return self.connect()
+        return self.serial
 
     def check_stop(self):
         if self.stopped is not None and self.stopped.is_set():
