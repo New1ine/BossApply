@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from engine.adb_client import AdbClient, AdbTimeoutError, TransientUiDumpError, UiDumpError
+from bossapply.engine.adb_client import AdbClient, AdbTimeoutError, TransientUiDumpError, UiDumpError
 
 
 class AdbClientTests(unittest.TestCase):
@@ -17,7 +17,7 @@ class AdbClientTests(unittest.TestCase):
 
     def test_read_only_scan_handles_fragmented_device_list(self):
         response = b'ABC123\tdevice usb:2 model:Phone\nXYZ\tunauthorized\n'
-        with patch('engine.adb_client.socket.create_connection') as connect:
+        with patch('bossapply.engine.adb_client.socket.create_connection') as connect:
             sock = connect.return_value.__enter__.return_value
             sock.recv.side_effect = [b'O', b'KAY', f'{len(response):04x}'.encode(), response]
             self.adb.port = 5037
@@ -27,7 +27,7 @@ class AdbClientTests(unittest.TestCase):
             sock.sendall.assert_called_once_with(b'000ehost:devices-l')
 
     def test_scan_distinguishes_unrelated_listener_from_empty_adb_server(self):
-        with patch('engine.adb_client.socket.create_connection') as connect:
+        with patch('bossapply.engine.adb_client.socket.create_connection') as connect:
             sock = connect.return_value.__enter__.return_value
             for chunks, expected in [([b'HTTP'], None), ([b'OKAY', b'0000'], [])]:
                 with self.subTest(chunks=chunks):
@@ -107,7 +107,7 @@ adb-phone-correct _adb-tls-connect._tcp. 192.168.1.30:34567
             stop.start()
             return process
 
-        with patch('engine.adb_client.subprocess.Popen', side_effect=substitute_adb):
+        with patch('bossapply.engine.adb_client.subprocess.Popen', side_effect=substitute_adb):
             with self.assertRaises(InterruptedError):
                 self.adb._run_for_port(5037, 'devices', timeout=1)
         self.assertIsNotNone(processes[0].poll())
@@ -119,7 +119,7 @@ adb-phone-correct _adb-tls-connect._tcp. 192.168.1.30:34567
         def substitute_adb(_args, **kwargs):
             return popen([sys.executable, '-c', code], **kwargs)
 
-        with patch('engine.adb_client.subprocess.Popen', side_effect=substitute_adb):
+        with patch('bossapply.engine.adb_client.subprocess.Popen', side_effect=substitute_adb):
             self.assertEqual(self.adb._run_for_port(5037, 'pair', input_data=b'012345\n'),
                              b'012345\n')
 
@@ -132,7 +132,7 @@ adb-phone-correct _adb-tls-connect._tcp. 192.168.1.30:34567
             processes.append(process)
             return process
 
-        with patch('engine.adb_client.subprocess.Popen', side_effect=substitute_adb):
+        with patch('bossapply.engine.adb_client.subprocess.Popen', side_effect=substitute_adb):
             with self.assertRaises(AdbTimeoutError):
                 self.adb._run_for_port(5037, 'devices', timeout=0.05)
         self.assertIsNotNone(processes[0].poll())

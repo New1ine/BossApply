@@ -2,6 +2,18 @@
 
 通过 ADB 控制安卓手机上的 BOSS 直聘 App 的桌面工具。
 
+## 目录结构
+
+```text
+gui.py             桌面应用启动入口
+bossapply/         桌面界面、任务控制与本地投递统计
+  engine/          ADB 交互、投递流程与安卓界面解析
+scripts/           Windows 和 Linux 的构建脚本
+tests/             回归测试
+```
+
+从源码运行时，`config.json` 和 `delivery_stats.sqlite3` 保存在项目根目录。Windows 打包版使用 `%APPDATA%\BossApply`。本地配置、投递统计、ADB 文件和构建产物均不纳入 Git。
+
 ## 部署运行
 
 需要 Python 3.11 或更新版本。
@@ -55,9 +67,9 @@ python -m unittest discover -v
 python -m pip install -r requirements.txt "PyInstaller>=6.22.3,<7"
 ```
 
-Windows 从已激活的 Python 环境运行 `build_windows.bat`，将生成 `dist/BossApply.exe`。打包前将 Android SDK Platform-Tools 放在 `platform-tools/` 或 `platform-tools/platform-tools-windows/`。
+Windows 从已激活的 Python 环境运行 `.\scripts\build_windows.bat`，将生成 `dist/BossApply.exe`。打包前将 Android SDK Platform-Tools 放在 `platform-tools/` 或 `platform-tools/platform-tools-windows/`。
 
-Linux 从已激活的 Python 环境运行 `bash build_linux.sh`，将生成 `dist/BossApply/`。如需随包分发 ADB，将 Linux 的 Platform-Tools 放在 `platform-tools/` 或 `platform-tools/platform-tools-linux/`；也可直接使用目标系统安装的 ADB。
+Linux 从已激活的 Python 环境运行 `bash scripts/build_linux.sh`，将生成 `dist/BossApply/`。如需随包分发 ADB，将 Linux 的 Platform-Tools 放在 `platform-tools/` 或 `platform-tools/platform-tools-linux/`。也可直接使用目标系统安装的 ADB。
 
 ## 免责声明
 

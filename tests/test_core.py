@@ -11,8 +11,7 @@ from pathlib import Path
 from threading import Event
 from unittest.mock import patch
 
-import core
-import delivery_stats
+from bossapply import core, delivery_stats
 
 
 class ConfigTests(unittest.TestCase):

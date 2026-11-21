@@ -3,8 +3,8 @@ from collections import deque
 from unittest.mock import Mock, patch
 from xml.etree import ElementTree
 
-from engine.adb_client import AdbTimeoutError, TransientUiDumpError, UiDumpError
-from engine.workflow import BOSS_PACKAGE, UiTimeoutError, Workflow
+from bossapply.engine.adb_client import AdbTimeoutError, TransientUiDumpError, UiDumpError
+from bossapply.engine.workflow import BOSS_PACKAGE, UiTimeoutError, Workflow
 
 
 def screen(contents, package=BOSS_PACKAGE):
@@ -70,7 +70,7 @@ class WorkflowTests(unittest.TestCase):
     def workflow(self, adb, **config):
         cfg = {"run": {"timeout": 1, "limit": 1, "max_scroll_attempts": 1}, "actions": {}}
         cfg.update(config)
-        fake_time = patch("engine.workflow.time.monotonic", lambda: adb.now)
+        fake_time = patch("bossapply.engine.workflow.time.monotonic", lambda: adb.now)
         fake_time.start()
         self.addCleanup(fake_time.stop)
         return Workflow(adb, cfg, log=Mock(), progress=Mock())

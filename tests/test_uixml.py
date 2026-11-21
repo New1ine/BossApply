@@ -1,7 +1,7 @@
 import unittest
 from xml.etree.ElementTree import Element, fromstring
 
-from engine.uixml import list_cards, middle, query, rect
+from bossapply.engine.uixml import list_cards, middle, query, rect
 
 
 class UiXmlTests(unittest.TestCase):

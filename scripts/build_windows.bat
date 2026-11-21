@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 set "NoDefaultCurrentDirectoryInExePath=1"
-pushd "%~dp0" || exit /b 1
+pushd "%~dp0.." || exit /b 1
 
 call :build
 if errorlevel 1 (

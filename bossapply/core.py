@@ -9,14 +9,15 @@ import threading
 from collections import deque
 from pathlib import Path
 
-from delivery_stats import DailyDeliveryStats, DeliveryStatsError
-from engine.adb_client import AdbClient
-from engine.workflow import Workflow
+from . import PROJECT_ROOT
+from .delivery_stats import DailyDeliveryStats, DeliveryStatsError
+from .engine.adb_client import AdbClient
+from .engine.workflow import Workflow
 
 BASE_DIR = (
     Path(os.environ.get("APPDATA") or Path.home()) / "BossApply"
     if getattr(sys, "frozen", False)
-    else Path(__file__).resolve().parent
+    else PROJECT_ROOT
 )
 CONFIG_PATH = BASE_DIR / "config.json"
 DELIVERY_STATS_PATH = BASE_DIR / "delivery_stats.sqlite3"

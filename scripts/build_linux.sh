@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd -- "$(dirname -- "$0")"
+cd -- "$(dirname -- "$0")/.."
 
 if ! python -I -c "from importlib.metadata import version; import qrcode; from PIL import ImageTk; version('PyInstaller'); version('customtkinter')"; then
     printf '%s\n' 'Activate the Python environment with the project requirements and PyInstaller installed.' >&2

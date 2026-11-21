@@ -14,6 +14,8 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from .. import PROJECT_ROOT
+
 
 class AdbTimeoutError(RuntimeError):
     """ADB 命令在限定时间内没有完成。"""
@@ -60,8 +62,7 @@ class AdbClient:
             raise RuntimeError('找不到指定的 ADB 可执行文件，请检查 ADB 路径')
 
         bundle_root = Path(sys._MEIPASS) if getattr(sys, 'frozen', False) else None
-        roots = ([Path(sys.executable).resolve().parent, bundle_root] if bundle_root else
-                 [Path(__file__).resolve().parents[1]])
+        roots = [Path(sys.executable).resolve().parent, bundle_root] if bundle_root else [PROJECT_ROOT]
         name = 'adb.exe' if sys.platform == 'win32' else 'adb'
 
         platform_dir = 'platform-tools-windows' if sys.platform == 'win32' else 'platform-tools-linux'
