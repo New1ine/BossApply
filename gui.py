@@ -21,7 +21,7 @@ if sys.stderr is None:
 
 import customtkinter as ctk
 
-from core import CONTROLLER, read_config, write_config
+from core import CONTROLLER, normalize_config, read_config, write_config
 from engine.adb_client import AdbClient
 
 ctk.set_appearance_mode("light")
@@ -38,23 +38,96 @@ ACCENT = "#2563EB"
 BORDER = "#E5E9F0"
 
 
+class KeywordFilter(ctk.CTkFrame):
+    def __init__(self, parent, label, hint):
+        super().__init__(parent, fg_color="transparent")
+        self.enabled = tk.BooleanVar(master=self)
+        self.chips = {}
+        ctk.CTkCheckBox(self, text=label, variable=self.enabled, text_color=TEXT,
+                        fg_color=ACCENT).pack(anchor="w")
+        ctk.CTkLabel(self, text=hint, text_color=MUTED,
+                     font=ctk.CTkFont(size=13)).pack(anchor="w", pady=(2, 4))
+
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x")
+        self.entry = ctk.CTkEntry(row, width=90, height=34, placeholder_text="输入关键词",
+                                  border_color=BORDER, fg_color=WHITE, text_color=TEXT)
+        self.entry.pack(side="left", fill="x", expand=True, padx=(0, 7))
+        self.entry.bind("<Return>", self.add_entry)
+        ctk.CTkButton(row, text="添加", width=55, height=34, fg_color="#EAF1FF",
+                      hover_color="#D9E7FF", text_color=ACCENT,
+                      command=self.add_entry).pack(side="right")
+
+        self.tags = tk.Frame(self, bg=WHITE, height=1)
+        self.tags.pack(fill="x", pady=(7, 0))
+        self.tags.bind("<Configure>", self._layout_tags)
+
+    def add_entry(self, event=None):
+        self.add_keyword(self.entry.get())
+        self.entry.delete(0, "end")
+
+    def add_keyword(self, keyword):
+        keyword = keyword.strip()
+        key = keyword.casefold()
+        if not key or key in self.chips:
+            return
+        chip = tk.Button(self.tags, text=f"{keyword}  ×", font=(FONT_FAMILY, 10),
+                         bg="#EAF1FF", activebackground="#D9E7FF", fg=ACCENT,
+                         activeforeground=ACCENT, relief="flat", borderwidth=0,
+                         highlightthickness=0, padx=8, pady=3, cursor="hand2",
+                         command=lambda: self._remove_keyword(key))
+        self.chips[key] = (keyword, chip)
+        self._layout_tags()
+
+    def _remove_keyword(self, key):
+        _, chip = self.chips.pop(key)
+        chip.destroy()
+        self._layout_tags()
+
+    def keywords(self):
+        return [keyword for keyword, _ in self.chips.values()]
+
+    def _layout_tags(self, event=None):
+        width = self.tags.winfo_width()
+        if width <= 1:
+            return
+        x = y = row_height = 0
+        for _, chip in self.chips.values():
+            chip.configure(wraplength=max(1, width - 20))
+            chip_width = min(chip.winfo_reqwidth(), width)
+            chip_height = chip.winfo_reqheight()
+            if x and x + chip_width > width:
+                x, y, row_height = 0, y + row_height + 5, 0
+            chip.place(x=x, y=y, width=chip_width)
+            x += chip_width + 5
+            row_height = max(row_height, chip_height)
+        self.tags.configure(height=max(1, y + row_height))
+
+
 class Desktop(ctk.CTk):
-    def __init__(self):
+    def __init__(self, cfg=None):
+        cfg = read_config() if cfg is None else cfg
         super().__init__(fg_color=BG)
         self.title("BossApply")
         self.geometry("770x790")
         self.minsize(690, 650)
-        self.cfg = read_config()
+        self.cfg = cfg
         self.events = queue.Queue()
         self.device_choices = {}  # display string -> (serial, port)
+        self.device_source = None
+        self.device_operation = None
+        self.device_cancel = None
+        self.closing = False
         self.advanced_open = False
         self.wifi_open = False
-        self.qr_session = 0
-        self.qr_cancel = threading.Event()
         self._last_log_count = 0
         self._last_result = "idle"
+        self._last_controls = None
         self._init_ui()
         self._load()
+        state = CONTROLLER.snapshot()
+        self._update_controls(state)
+        self._update_today_success(state['today_success'])
         self.after(250, self._poll)
         self.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -159,16 +232,37 @@ class Desktop(ctk.CTk):
         self.wifi_box.pack_forget()
 
         settings = self._card(content)
-        self._header(settings, "投递设置")
+        settings_top = ctk.CTkFrame(settings, fg_color="transparent")
+        settings_top.pack(fill="x", padx=18, pady=(12, 9))
+        ctk.CTkLabel(settings_top, text="投递设置", text_color=TEXT,
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(side="left")
+        self.today_success = ctk.CTkLabel(settings_top, text="", fg_color="#EAF1FF",
+                                          text_color=ACCENT, corner_radius=8, height=32, padx=10,
+                                          font=ctk.CTkFont(size=14, weight="bold"))
+        self.today_success.pack(side="right")
         row = ctk.CTkFrame(settings, fg_color="transparent")
         row.pack(fill="x", padx=(18, 6), pady=(0, 18))
-        self.limit = self._entry(row, "投递数量（1～150）")
+        self.limit = self._entry(row, "投递上限（1～150）")
+
+        filters = self._card(content)
+        self._header(filters, "关键词筛选")
+        ctk.CTkLabel(filters, text="匹配职位卡片上的文字，优先执行反向筛选。",
+                     text_color=MUTED, font=ctk.CTkFont(size=13)).pack(anchor="w", padx=18, pady=(0, 9))
+        row = ctk.CTkFrame(filters, fg_color="transparent")
+        row.pack(fill="x", padx=18, pady=(0, 14))
+        row.grid_columnconfigure((0, 1), weight=1, uniform="filters")
+        self.keyword_filters = {
+            'exclude': KeywordFilter(row, "反向筛选", "命中任一标签就跳过"),
+            'include': KeywordFilter(row, "正向筛选", "仅沟通命中任一标签的职位"),
+        }
+        self.keyword_filters['exclude'].grid(row=0, column=0, sticky="nsew", padx=(0, 9))
+        self.keyword_filters['include'].grid(row=0, column=1, sticky="nsew", padx=(9, 0))
 
         send = self._card(content)
         self._header(send, "发送方式")
         ctk.CTkLabel(send, text="默认招呼语（点击立即沟通后由 BOSS 自动发送）", text_color=MUTED,
                      font=ctk.CTkFont(size=14)).pack(anchor="w", padx=18, pady=(0, 8))
-        self.image_enabled = tk.BooleanVar(value=True)
+        self.image_enabled = tk.BooleanVar(value=False)
         image_switch = ctk.CTkSwitch(send, text="同时发送简历图片", variable=self.image_enabled,
                                      onvalue=True, offvalue=False, progress_color=ACCENT,
                                      text_color=TEXT, command=self._image_fields_toggle)
@@ -225,7 +319,7 @@ class Desktop(ctk.CTk):
         progress.pack(fill="x", pady=(0, 9))
         self.progress_label = ctk.CTkLabel(progress, text="就绪", text_color=MUTED)
         self.progress_label.pack(side="left")
-        self.progress_count = ctk.CTkLabel(progress, text="0 / 0", text_color=MUTED)
+        self.progress_count = ctk.CTkLabel(progress, text="本次任务 0 / 0", text_color=MUTED)
         self.progress_count.pack(side="right")
         self.bar = ctk.CTkProgressBar(content, height=7, progress_color=ACCENT, fg_color="#DDE5F2")
         self.bar.pack(fill="x", pady=(0, 13))
@@ -234,6 +328,11 @@ class Desktop(ctk.CTk):
                                    fg_color="#EDF2F8", corner_radius=9, wrap="word")
         self.logs.pack(fill="x", pady=(0, 8))
         self.logs.configure(state="disabled")
+
+    def _update_today_success(self, count):
+        text = "今日投递成功数不可用" if count is None else f"今日投递成功 {count} 份"
+        if text != self.today_success.cget('text'):
+            self.today_success.configure(text=text)
 
     def _load(self):
         c = self.cfg
@@ -248,6 +347,10 @@ class Desktop(ctk.CTk):
         self.image_enabled.set(bool(c['actions']['image']))
         self.original.set(bool(c['image']['original']))
         self._image_fields_toggle()
+        for kind, editor in self.keyword_filters.items():
+            editor.enabled.set(bool(c['filters'][f'{kind}_enabled']))
+            for keyword in c['filters'][f'{kind}_keywords']:
+                editor.add_keyword(keyword)
 
     def _image_fields_toggle(self):
         if self.image_enabled.get():
@@ -264,12 +367,17 @@ class Desktop(ctk.CTk):
         self.advanced_btn.configure(text="高级设置  ▾" if self.advanced_open else "高级设置  ▸")
 
     def _toggle_wifi(self):
-        self.wifi_open = not self.wifi_open
-        if self.wifi_open:
+        self._set_wifi_open(not self.wifi_open)
+
+    def _set_wifi_open(self, opened):
+        if opened == self.wifi_open:
+            return
+        self.wifi_open = opened
+        if opened:
             self.wifi_box.pack(fill="x", padx=18)
         else:
             self.wifi_box.pack_forget()
-        self.wifi_btn.configure(text="WiFi 调试  ▾" if self.wifi_open else "WiFi 调试  ▸")
+        self.wifi_btn.configure(text="WiFi 调试  ▾" if opened else "WiFi 调试  ▸")
 
     def _set_status(self, text, color=MUTED):
         self.status.configure(text=text, text_color=color)
@@ -279,17 +387,57 @@ class Desktop(ctk.CTk):
     def _device_config(self):
         cfg = copy.deepcopy(self.cfg['device'])
         cfg['path'] = self.adb_path.get().strip() or 'auto'
-        cfg['port'] = int(self.port.get())
-        if not 0 <= cfg['port'] <= 65535:
-            raise ValueError("ADB 端口必须在 0～65535 之间")
+        cfg['port'] = self.port.get()
         cfg['serial'] = 'auto'
-        return cfg
+        return normalize_config({'device': cfg})['device']
 
-    def _wifi_busy(self, busy):
-        state = 'disabled' if busy else 'normal'
-        self.pair_btn.configure(state=state)
-        self.wifi_connect_btn.configure(state=state)
-        self.qr_btn.configure(state=state)
+    @staticmethod
+    def _device_source(cfg):
+        return cfg['path'], cfg['port']
+
+    def _selected_device(self, cfg):
+        if self.device_source == self._device_source(cfg):
+            return self.device_choices.get(self.device_menu.get())
+        return None
+
+    def _update_controls(self, state):
+        busy = self.closing or self.device_operation is not None or state['running']
+        controls = (busy, self.device_operation, state['running'], state['stopping'], self.closing)
+        if controls == self._last_controls:
+            return
+        self._last_controls = controls
+        mode = 'disabled' if busy else 'normal'
+        self.scan_btn.configure(state=mode, text="检测中…" if self.device_operation == 'scan' else "检测设备")
+        for control in (self.device_menu, self.pair_btn, self.wifi_connect_btn, self.qr_btn, self.start_btn):
+            control.configure(state=mode)
+        self.stop_btn.configure(state='normal' if state['running'] and not state['stopping'] else 'disabled')
+
+    def _start_device_job(self, kind, cfg, status, job):
+        state = CONTROLLER.snapshot()
+        if self.closing or self.device_operation is not None or state['running']:
+            return False
+        cancelled = threading.Event()
+        source = self._device_source(cfg)
+        self.device_cancel = cancelled
+        self.device_operation = kind
+        self._update_controls(state)
+        self._set_status(status)
+
+        def run():
+            try:
+                adb = AdbClient(cfg, stopped=cancelled)
+                result = job(adb, cancelled)
+            except Exception as err:
+                self.events.put((kind, source, None, err))
+            else:
+                self.events.put((kind, source, result, None))
+
+        try:
+            threading.Thread(target=run, daemon=True).start()
+        except RuntimeError as err:
+            self.events.put((kind, source, None, err))
+            return False
+        return True
 
     def start_qr_pairing(self):
         try:
@@ -299,49 +447,39 @@ class Desktop(ctk.CTk):
             qr.add_data(payload)
             qr.make(fit=True)
             image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-            self.qr_image = ImageTk.PhotoImage(image)
+            qr_image = ImageTk.PhotoImage(image)
         except (ValueError, OSError) as err:
             messagebox.showwarning("扫码配对", str(err), parent=self)
             return
-        self.qr_image_label.configure(image=self.qr_image)
-        self.wifi_tabs.configure(height=self.qr_image.height() + 230)
-        self.qr_area.pack(fill="x", pady=(0, 12))
-        self.qr_session += 1
-        session = self.qr_session
-        self.qr_cancel = threading.Event()
-        cancelled = self.qr_cancel
-        self._wifi_busy(True)
-        self._set_status("等待手机扫描二维码…")
+        def job(adb, cancelled):
+            endpoint = adb.pair_wifi_qr(name, password, cancelled)
+            return self._paired_result(adb, endpoint)
 
-        def job():
-            try:
-                adb = AdbClient(cfg, stopped=cancelled)
-                endpoint = adb.pair_wifi_qr(name, password, cancelled)
-                try:
-                    serial = adb.connect_paired_wifi(endpoint)
-                except RuntimeError as err:
-                    self.events.put(('qr_paired', session, str(err)))
-                else:
-                    if serial:
-                        self.events.put(('qr_connected', session, serial, adb.port))
-                    else:
-                        self.events.put(('qr_paired', session, ''))
-            except InterruptedError:
-                pass
-            except Exception as err:
-                self.events.put(('qr_error', session, str(err)))
-        threading.Thread(target=job, daemon=True).start()
+        if self._start_device_job('qr', cfg, "等待手机扫描二维码…", job):
+            self.qr_image = qr_image
+            self.qr_image_label.configure(image=self.qr_image)
+            self.wifi_tabs.configure(height=self.qr_image.height() + 230)
+            self.qr_area.pack(fill="x", pady=(0, 12))
 
     def cancel_qr_pairing(self):
-        self.qr_cancel.set()
-        self.qr_session += 1
-        self._hide_qr()
-        self._wifi_busy(False)
-        self._set_status("已取消扫码配对")
+        if self.device_operation == 'qr':
+            self.device_cancel.set()
+            self._hide_qr()
+            self._set_status("正在取消扫码配对…")
 
     def _hide_qr(self):
         self.qr_area.pack_forget()
+        self.qr_image_label.configure(image='')
+        self.qr_image = None
         self.wifi_tabs.configure(height=310)
+
+    @staticmethod
+    def _paired_result(adb, endpoint):
+        try:
+            serial = adb.connect_paired_wifi(endpoint)
+        except RuntimeError as err:
+            return None, adb.port, str(err)
+        return serial, adb.port, ''
 
     def pair_wifi(self):
         try:
@@ -354,25 +492,12 @@ class Desktop(ctk.CTk):
         except ValueError as err:
             messagebox.showwarning("WiFi 配对", str(err), parent=self)
             return
-        self._wifi_busy(True)
-        self._set_status("正在 WiFi 配对…")
+        def job(adb, _cancelled):
+            adb.pair_wifi(address, code)
+            return self._paired_result(adb, adb.paired_endpoint)
 
-        def job():
-            try:
-                adb = AdbClient(cfg)
-                adb.pair_wifi(address, code)
-                try:
-                    serial = adb.connect_paired_wifi(adb.paired_endpoint)
-                except RuntimeError as err:
-                    self.events.put(('wifi_paired', str(err)))
-                else:
-                    if serial:
-                        self.events.put(('wifi_connected', serial, adb.port))
-                    else:
-                        self.events.put(('wifi_paired', ''))
-            except Exception as err:
-                self.events.put(('wifi_error', str(err)))
-        threading.Thread(target=job, daemon=True).start()
+        if self._start_device_job('pair', cfg, "正在 WiFi 配对…", job):
+            self.pair_code.set('')
 
     def connect_wifi(self):
         try:
@@ -382,49 +507,34 @@ class Desktop(ctk.CTk):
         except ValueError as err:
             messagebox.showwarning("WiFi 连接", str(err), parent=self)
             return
-        self._wifi_busy(True)
-        self._set_status("正在连接 WiFi 手机…")
+        def job(adb, _cancelled):
+            serial = adb.connect_wifi(address)
+            return serial, adb.port, ''
 
-        def job():
-            try:
-                adb = AdbClient(cfg)
-                serial = adb.connect_wifi(address)
-                self.events.put(('wifi_connected', serial, adb.port))
-            except Exception as err:
-                self.events.put(('wifi_error', str(err)))
-        threading.Thread(target=job, daemon=True).start()
+        self._start_device_job('connect', cfg, "正在连接 WiFi 手机…", job)
 
     def _make_config(self):
         cfg = copy.deepcopy(self.cfg)
-        n = int(self.limit.get())
-        if not 1 <= n <= 150:
-            raise ValueError("投递数量必须在 1～150 之间")
-        cfg['run']['limit'] = n
-        cfg['run']['timeout'] = int(self.timeout.get())
-        if not 3 <= cfg['run']['timeout'] <= 120:
-            raise ValueError("等待页面出现上限必须在 3～120 秒之间")
-        cfg['run']['scroll_fraction'] = float(self.scroll.get())
-        if not 0 < cfg['run']['scroll_fraction'] < 1:
-            raise ValueError("短滑屏幕比例必须在 0～1 之间")
-        cfg['run']['max_scroll_attempts'] = int(self.scroll_attempts.get())
-        if not 1 <= cfg['run']['max_scroll_attempts'] <= 100:
-            raise ValueError("最大短滑次数必须在 1～100 之间")
-        cfg['device'].update(self._device_config())
-        cfg['device']['click_interval'] = float(self.delay.get())
-        if not 0 <= cfg['device']['click_interval'] <= 5:
-            raise ValueError("操作后停顿必须在 0～5 秒之间")
-        selection = self.device_menu.get()
-        if selection in self.device_choices:
-            serial, port = self.device_choices[selection]
-            cfg['device']['serial'] = serial
-            if cfg['device']['port'] == 0:
-                cfg['device']['port'] = port
+        cfg['run'].update(limit=self.limit.get(), timeout=self.timeout.get(),
+                          scroll_fraction=self.scroll.get(), max_scroll_attempts=self.scroll_attempts.get())
+        device = self._device_config()
+        selection = self._selected_device(device)
+        if selection is not None:
+            device['serial'] = selection[0]
+        elif self._device_source(device) == self._device_source(self.cfg['device']):
+            device['serial'] = self.cfg['device']['serial']
+        device['click_interval'] = self.delay.get()
+        cfg['device'] = device
         cfg['actions']['image'] = bool(self.image_enabled.get())
         cfg['actions']['quick_phrase'] = False
-        cfg['image']['album'] = self.album.get().strip() or 'My Documents'
-        cfg['image']['index'] = max(1, int(self.index.get()))
-        cfg['image']['original'] = bool(self.original.get())
-        return cfg
+        if cfg['actions']['image']:
+            cfg['image'].update(album=self.album.get().strip() or 'My Documents',
+                                index=self.index.get(), original=bool(self.original.get()))
+        for kind, editor in self.keyword_filters.items():
+            editor.add_entry()
+            cfg['filters'][f'{kind}_enabled'] = editor.enabled.get()
+            cfg['filters'][f'{kind}_keywords'] = editor.keywords()
+        return normalize_config(cfg)
 
     def save(self, quiet=False):
         try:
@@ -444,134 +554,166 @@ class Desktop(ctk.CTk):
         except ValueError as err:
             messagebox.showwarning("ADB 检测", str(err), parent=self)
             return
-        self.scan_btn.configure(state="disabled", text="检测中…")
-        self._set_status("正在检测设备…")
-        preferred = self.cfg['device'].get('serial', 'auto')
-        def job():
-            try:
-                adb = AdbClient(device_cfg)
-                seen = adb.discover_devices()
-                devices = [
-                    (f"{dev.get('model') or 'Android'} · {dev['serial']}  (ADB {port})",
-                     dev['serial'], port)
-                    for port, dev in seen
-                ]
-                if not devices:
-                    raise RuntimeError("没有找到已授权的手机，请检查 USB 或 WiFi 调试连接")
-                self.events.put(('devices', devices, preferred))
-            except Exception as err:
-                self.events.put(('device_error', str(err)))
-        threading.Thread(target=job, daemon=True).start()
+        preferred = self._selected_device(device_cfg)
+
+        def job(adb, _cancelled):
+            devices = {
+                f"{dev.get('model') or 'Android'} · {dev['serial']}  (ADB {port})": (dev['serial'], port)
+                for port, dev in adb.discover_devices()
+            }
+            if not devices:
+                raise RuntimeError("没有找到已授权的手机，请检查 USB 或 WiFi 调试连接")
+            return devices, preferred
+
+        self._start_device_job('scan', device_cfg, "正在检测设备…", job)
 
     def start(self):
-        if self.device_menu.get() not in self.device_choices:
-            messagebox.showwarning("手机设备", "请先检测或连接手机，再选择设备", parent=self)
+        if self.closing or self.device_operation is not None or CONTROLLER.snapshot()['running']:
+            return
+        try:
+            selection = self._selected_device(self._device_config())
+        except ValueError as err:
+            messagebox.showerror("配置无效", str(err), parent=self)
+            return
+        if selection is None:
+            messagebox.showwarning("手机设备", "请使用当前 ADB 路径和端口检测或连接手机，再选择设备", parent=self)
             return
         if not self.save(quiet=True):
             return
-        if CONTROLLER.start():
+        run_cfg = copy.deepcopy(self.cfg)
+        run_cfg['device']['serial'], run_cfg['device']['port'] = selection
+        try:
+            started = CONTROLLER.start(run_cfg)
+        except (ValueError, RuntimeError) as err:
+            messagebox.showerror("无法启动投递", str(err), parent=self)
+            return
+        if started:
             self._set_status("正在运行", ACCENT)
             self._last_log_count = 0
             self._last_result = 'running'
             self.logs.configure(state='normal')
             self.logs.delete('1.0', 'end')
             self.logs.configure(state='disabled')
+            self._update_controls(CONTROLLER.snapshot())
 
     def stop(self):
         CONTROLLER.halt()
+        self._update_controls(CONTROLLER.snapshot())
+
+    def _show_devices(self, source, devices, selected):
+        self.device_source = source
+        self.device_choices = devices
+        prompt = "请选择设备" if devices else "请先检测或连接手机"
+        self.device_menu.configure(values=list(devices) or [prompt])
+        self.device_menu.set(selected or prompt)
+        if selected is not None:
+            self._set_wifi_open(False)
+
+    def _handle_device_result(self, kind, source, result, error):
+        cancelled = self.device_cancel.is_set()
+        self.device_cancel = None
+        self.device_operation = None
+        if kind == 'qr':
+            self._hide_qr()
+        if self.closing:
+            return
+        if cancelled:
+            self._set_status("已取消扫码配对")
+            return
+        if error is not None:
+            if kind == 'scan':
+                self._show_devices(None, {}, None)
+            title = {'scan': "ADB 检测", 'qr': "扫码配对", 'pair': "WiFi 配对", 'connect': "WiFi 连接"}[kind]
+            self._set_status(f"{title}失败", "#C24141")
+            messagebox.showwarning(title, str(error), parent=self)
+            return
+        if kind == 'scan':
+            devices, preferred = result
+            selected = next((name for name, device in devices.items() if device == preferred), None)
+            if selected is None:
+                saved = [name for name, (serial, _) in devices.items()
+                         if serial == self.cfg['device']['serial']]
+                if len(saved) == 1:
+                    selected = saved[0]
+                elif len(devices) == 1:
+                    selected = next(iter(devices))
+            self._show_devices(source, devices, selected)
+            self._set_status(f"已检测到 {len(devices)} 台设备", "#188264")
+            return
+
+        serial, port, warning = result
+        if serial is None:
+            if kind == 'qr':
+                self.wifi_tabs.set("配对码配对")
+            self._set_status("已配对，请用手机无线调试主页的 IP 地址和端口连接")
+            if warning:
+                messagebox.showwarning("WiFi 自动连接未完成", warning, parent=self)
+            return
+        devices = dict(self.device_choices) if self.device_source == source else {}
+        device = (serial, port)
+        name = next((name for name, choice in devices.items() if choice == device),
+                    f"Android · {serial}  (ADB {port})")
+        devices[name] = device
+        self._show_devices(source, devices, name)
+        self._set_status(f"WiFi 已连接 · {serial}", "#188264")
 
     def _poll(self):
-        while True:
-            try:
-                event = self.events.get_nowait()
-            except queue.Empty:
-                break
-            if event[0] == 'devices':
-                rows, selected = event[1], event[2]
-                self.device_choices = {name: (serial, port) for name, serial, port in rows}
-                items = list(self.device_choices)
-                self.device_menu.configure(values=items)
-                default_name = next((name for name, serial, port in rows if serial == selected), items[0])
-                self.device_menu.set(default_name)
-                self._set_status(f"已连接 · {self.device_choices[default_name][0]}", "#188264")
-                self.scan_btn.configure(state="normal", text="检测设备")
-            elif event[0] == 'device_error':
-                self._set_status("连接失败", "#C24141")
-                self.scan_btn.configure(state="normal", text="检测设备")
-                messagebox.showwarning("ADB 检测", event[1], parent=self)
-            elif event[0] == 'wifi_paired':
-                self.pair_code.set('')
-                self._wifi_busy(False)
-                self._set_status("配对成功；如未自动连接，请填写无线调试主页的 IP 地址和端口", "#188264")
-                if event[1]:
-                    messagebox.showwarning("自动连接未完成", event[1], parent=self)
-            elif event[0] == 'qr_paired' and event[1] == self.qr_session:
-                self._hide_qr()
-                self._wifi_busy(False)
-                self.wifi_tabs.set("配对码配对")
-                self._set_status("扫码配对成功，WiFi 尚未连接。请填写手机无线调试主页的 IP 地址和端口")
-                if event[2]:
-                    messagebox.showwarning("WiFi 自动连接未完成", event[2], parent=self)
-            elif event[0] == 'qr_error' and event[1] == self.qr_session:
-                self._hide_qr()
-                self._wifi_busy(False)
-                self._set_status("扫码配对失败", "#C24141")
-                messagebox.showwarning("扫码配对", event[2], parent=self)
-            elif event[0] in ('wifi_connected', 'qr_connected'):
-                if event[0] == 'qr_connected' and event[1] != self.qr_session:
-                    continue
-                serial, port = (event[2], event[3]) if event[0] == 'qr_connected' else (event[1], event[2])
-                if event[0] == 'qr_connected':
-                    self._hide_qr()
-                name = f"Android · {serial}  (ADB {port})"
-                self.device_choices[name] = (serial, port)
-                self.device_menu.configure(values=list(self.device_choices))
-                self.device_menu.set(name)
-                self.cfg['device']['serial'] = serial
-                self.cfg['device']['port'] = port
-                self._wifi_busy(False)
-                self._set_status(f"WiFi 已连接 · {serial}", "#188264")
-                try:
-                    write_config(self.cfg)
-                except OSError as err:
-                    messagebox.showwarning("保存设备", str(err), parent=self)
-            elif event[0] == 'wifi_error':
-                self._wifi_busy(False)
-                self._set_status("WiFi 调试失败", "#C24141")
-                messagebox.showwarning("WiFi 调试", event[1], parent=self)
-
+        try:
+            event = self.events.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self._handle_device_result(*event)
         state = CONTROLLER.snapshot()
+        if self.closing and not state['running'] and self.device_operation is None:
+            self.destroy()
+            return
+        self._update_controls(state)
+        self._update_today_success(state['today_success'])
         n, limit = state['done'], state['limit']
-        self.progress_count.configure(text=f"{n} / {limit}")
+        self.progress_count.configure(text=f"本次任务 {n} / {limit}")
         self.bar.set(n / limit if limit else 0)
         if state['running']:
-            self.progress_label.configure(text="正在投递…")
-            self.start_btn.configure(state='disabled')
+            self.progress_label.configure(text="正在停止…" if state['stopping'] else "正在投递…")
         else:
-            self.start_btn.configure(state='normal')
             self.progress_label.configure(text={'complete':'任务完成','stopped':'已停止','error':'执行中断'}.get(state['result'],'就绪'))
             if self._last_result == 'running' and state['result'] in ('complete','stopped','error'):
                 self._set_status(self.progress_label.cget('text'))
         self._last_result = state['result']
-        logs = state['logs']
-        if len(logs) < self._last_log_count:
-            self._last_log_count = 0
-        if len(logs) > self._last_log_count:
+        if state['log_count'] != self._last_log_count:
             self.logs.configure(state='normal')
-            self.logs.insert('end', '\n'.join(logs[self._last_log_count:])+'\n')
+            self.logs.delete('1.0', 'end')
+            self.logs.insert('end', '\n'.join(state['logs']) + '\n')
             self.logs.see('end')
             self.logs.configure(state='disabled')
-            self._last_log_count = len(logs)
+            self._last_log_count = state['log_count']
         self.after(350, self._poll)
 
     def _close(self):
+        self.closing = True
         CONTROLLER.halt()
-        self.qr_cancel.set()
-        self.destroy()
+        if self.device_cancel is not None:
+            self.device_cancel.set()
+        state = CONTROLLER.snapshot()
+        if state['running'] or self.device_operation is not None:
+            self._update_controls(state)
+            self._set_status("正在停止操作并关闭…")
+        else:
+            self.destroy()
 
 
 def main():
-    Desktop().mainloop()
+    try:
+        cfg = read_config()
+    except (OSError, ValueError) as err:
+        dialog = tk.Tk()
+        dialog.withdraw()
+        try:
+            messagebox.showerror("无法读取设置", str(err), parent=dialog)
+        finally:
+            dialog.destroy()
+        return
+    Desktop(cfg).mainloop()
 
 
 if __name__ == '__main__':

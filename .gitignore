@@ -7,6 +7,8 @@ __pycache__/
 
 # Local config and third-party ADB binaries
 config.json
+delivery_stats.sqlite3
+delivery_stats.sqlite3-*
 platform-tools/
 
 # PyInstaller outputs

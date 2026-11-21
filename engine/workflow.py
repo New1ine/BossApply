@@ -1,15 +1,39 @@
 """按顺序投递：已实测的 BOSS UI 动作在此逐个封装。"""
+import re
 import time
-from .adb_client import AdbTimeoutError
-from .uixml import query, queries, rect, middle, node_id, list_cards
+import unicodedata
+from .adb_client import AdbTimeoutError, TransientUiDumpError
+from .uixml import query, queries, rect, middle, list_cards
 
 
-UI_DUMP_TIMEOUT = 10  # 单次 uiautomator 抓取上限，与页面等待上限分开。
+BOSS_PACKAGE = "com.hpbr.bosszhipin"
+DETAIL_BUTTONS = ("btn_chat", "btn_youxuan")
+CHAT_INPUT = "editText_with_scrollbar"
+UI_DUMP_TIMEOUT = 10
+UI_DUMP_RETRY_DELAYS = (0.25, 0.5, 1.0)
 MAX_RECOVERY_BACKS = 6
+MAX_ALBUM_SCROLLS = 12
+ALBUM_IDS = ("album_name", "tv_album_name")
+MEDIA_IDS = (*ALBUM_IDS, "mGalleryTextView", "media_thumbnail", "button_preview", "button_apply")
+ALBUM_COUNT_SUFFIX = re.compile(
+    r'(?:\s*\(\s*[0-9]+(?:,[0-9]{3})*\s*(?:张|项|个)?\s*\)|\s+[0-9]+(?:,[0-9]{3})*\s*(?:张|项|个))\s*$'
+)
+PREVIEW_CONFIRM_LABEL = re.compile(
+    r"(?:确定|确认|发送|确认发送|确定发送)(?:\s*\(\s*[1-9][0-9]*(?:\s*/\s*[0-9]+|\s*张)?\s*\))?"
+)
 
 
 class UiTimeoutError(RuntimeError):
     """等待目标页面或控件超时。"""
+
+
+def matching_keyword(keywords, texts):
+    for keyword in keywords:
+        keyword = keyword.strip()
+        folded = keyword.casefold()
+        if folded and any(folded in text for text in texts):
+            return keyword
+    return None
 
 
 class Workflow:
@@ -20,83 +44,136 @@ class Workflow:
         self.progress = progress
         self.done = set()
         self.anchor = None
-        self.screen = self.adb.size
+        self.timeout = float(self.cfg["run"].get("timeout", 18))
 
-    def wait_node(self, label, *, id=None, text=None, contains=None, with_root=False):
-        timeout = float(self.cfg["run"].get("timeout", 18))
-        until = time.monotonic() + timeout
-        while time.monotonic() < until:
-            root = self.adb.dump_ui(timeout=UI_DUMP_TIMEOUT)
+    @staticmethod
+    def validate_config(config):
+        if config["actions"].get("quick_phrase"):
+            raise ValueError("常用语功能暂未完成实机验证，请先关闭该选项")
+        filters = config.get("filters", {})
+        if filters.get("include_enabled") and not any(
+            keyword.strip() for keyword in filters.get("include_keywords", [])
+        ):
+            raise ValueError("开启正向筛选后，请至少添加一个关键词")
+
+    def ui_samples(self, deadline, interval):
+        retries = 0
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                root = self.adb.dump_ui(timeout=min(UI_DUMP_TIMEOUT, remaining))
+            except TransientUiDumpError as exc:
+                remaining = deadline - time.monotonic()
+                if retries >= len(UI_DUMP_RETRY_DELAYS) or remaining <= UI_DUMP_RETRY_DELAYS[retries]:
+                    raise
+                if not retries:
+                    self.log(f"手机界面抓取暂时失败，正在重试：{exc}")
+                self.adb.wait(UI_DUMP_RETRY_DELAYS[retries])
+                retries += 1
+                continue
+            except AdbTimeoutError:
+                root = None
+            else:
+                retries = 0
+
+            if root is not None and time.monotonic() < deadline:
+                windows = root.findall("node")
+                if windows:
+                    if len(windows) != 1 or windows[0].get("package") != BOSS_PACKAGE:
+                        raise RuntimeError("手机前台不是 BOSS 直聘独立页面，请返回已筛选的职位列表后重试")
+                    yield windows[0]
+
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                self.adb.wait(min(interval, remaining))
+
+    def wait_node(self, label, *, id=None, text=None, contains=None, with_root=False, require_enabled=False):
+        for root in self.ui_samples(time.monotonic() + self.timeout, 0.15):
             node = query(root, id=id, text=text, contains=contains)
-            if node is not None:
+            if node is not None and (not require_enabled or node.get("enabled") != "false"):
                 return (node, root) if with_root else node
-            self.adb.wait(0.15)
         raise UiTimeoutError("等待超时：" + label)
 
     def click(self, label, *, id=None, text=None, contains=None):
-        node = self.wait_node(label, id=id, text=text, contains=contains)
+        node = self.wait_node(label, id=id, text=text, contains=contains, require_enabled=True)
         self.adb.tap(*middle(node))
         self.log("点击：" + label)
 
-    def next_card(self):
+    @staticmethod
+    def detail_buttons(root):
+        buttons = [node for id in DETAIL_BUTTONS for node in queries(root, id)]
+        if not buttons:
+            return buttons
+        lst = query(root, id="rv_list")
+        if lst is not None:
+            list_nodes = set(lst.iter("node"))
+            buttons = [node for node in buttons if node not in list_nodes]
+        return buttons
+
+    @classmethod
+    def job_list_cards(cls, root):
+        if query(root, id=CHAT_INPUT) is not None or cls.detail_buttons(root):
+            return None
+        if query(root, id="rv_list") is None:
+            return None
+        cards = list_cards(root)
+        if not cards and any(query(root, id=id) is not None for id in MEDIA_IDS):
+            return None
+        return cards
+
+    def wait_job_list(self):
+        for root in self.ui_samples(time.monotonic() + self.timeout, 0.15):
+            cards = self.job_list_cards(root)
+            if cards is not None:
+                return cards
+        raise UiTimeoutError("未确认职位列表，请在手机上打开已筛选的职位列表")
+
+    def next_card(self, cards=None):
         """锚点下方逐个处理；底部显示不完整时小滑动并重新扫描。"""
-        for _ in range(int(self.cfg["run"].get("max_scroll_attempts", 20))):
-            _, root = self.wait_node("职位列表", id="rv_list", with_root=True)
-            cards = list_cards(root)
-            if not cards:
-                self.adb.wait(0.15)
-                continue
+        max_scrolls = int(self.cfg["run"].get("max_scroll_attempts", 20))
+        for scrolled in range(max_scrolls + 1):
+            if cards is None:
+                cards = self.wait_job_list()
             idx = next((i for i, c in enumerate(cards) if c["key"] == self.anchor), None)
             candidates = cards[idx + 1:] if idx is not None else cards
-            target = next((c for c in candidates if c["key"] not in self.done), None)
-            if target is not None and target["complete"]:
+            target = next((c for c in candidates if c["complete"] and c["key"] not in self.done), None)
+            if target is not None:
                 return target
+            if scrolled == max_scrolls:
+                break
             self.log("当前没有新的完整卡片，短滑并重新识别")
             self.adb.swipe_short(self.cfg["run"].get("scroll_fraction", 0.145))
-        raise RuntimeError("多次滚动后未发现下一张完整职位")
+            cards = None
+        return None
 
     def open_job(self, card):
         x1, y1, x2, y2 = card["bounds"]
         self.log("进入职位：" + card["title"] + " | " + card["company"])
         self.adb.tap((x1 + x2) // 2, (y1 + y2) // 2)
 
-    def send_greeting(self):
-        """仅在存在'立即沟通'时执行，否则跳过当前职位。"""
-        timeout = float(self.cfg["run"].get("timeout", 18))
-        deadline = time.monotonic() + timeout
-
-        while time.monotonic() < deadline:
-            root = self.adb.dump_ui(timeout=UI_DUMP_TIMEOUT)
-
-            # 详情页的 XML 也可能包含 rv_list，先识别实际的沟通按钮。
-            node = query(root, text="立即沟通")
-            if node is not None:
-                self.adb.tap(*middle(node))
-                self.log("点击：立即沟通")
-                self.wait_node("聊天输入框", id="editText_with_scrollbar")
-                return True
-
-            # 已出现详情页专用按钮时，可以直接判定其状态。
-            for btn_id in ("btn_chat", "btn_youxuan"):
-                node = query(root, id=btn_id)
-                if node is not None:
-                    label = node.get("text", "").strip()
-                    if label and label != "立即沟通":
-                        self.log(f"跳过职位：按钮为 {label}")
-                        return False
+    def greeting_button(self):
+        """仅识别职位详情页中可用的沟通按钮。"""
+        for root in self.ui_samples(time.monotonic() + self.timeout, 0.2):
+            labels = []
+            for node in self.detail_buttons(root):
+                if query(node, text="立即沟通") is not None:
+                    if node.get("enabled") != "false":
+                        return node
+                    continue
+                label = node.get("text", "").strip()
+                if label:
+                    labels.append(label)
+            if labels:
+                self.log(f"跳过职位：按钮为 {labels[0]}")
+                return None
 
             # 列表尚未消失时，不用列表里的文字判定职位状态。
             if query(root, id="rv_list") is None:
                 for status in ("继续沟通", "已沟通"):
                     if query(root, text=status) is not None:
                         self.log(f"跳过职位：{status}")
-                        return False
-
-            self.adb.wait(0.2)
-
-        self.log(f"跳过职位：等待 {timeout:g} 秒仍未检测到立即沟通")
-        return False
-
+                        return None
+        self.log(f"跳过职位：等待 {self.timeout:g} 秒仍未检测到可用的立即沟通按钮")
+        return None
 
     def open_attachment_menu(self):
         # 目前此图标不暴露文字/ID，按实测位置相对屏幕分辨率点击。
@@ -108,29 +185,67 @@ class Workflow:
         self.click("相册图片", id="mGalleryTextView")
         self.click("所有媒体", id="tv_title", text="所有媒体")
 
+    @staticmethod
+    def album_key(name):
+        return "".join(unicodedata.normalize("NFKC", name).casefold().split())
+
+    @staticmethod
+    def album_scroll_bounds(root, entry):
+        parents = {child: parent for parent in root.iter("node") for child in parent}
+        ancestor = parents.get(entry)
+        while ancestor is not None:
+            bounds = rect(ancestor)
+            if bounds is not None and ancestor.get("scrollable") == "true":
+                return bounds
+            ancestor = parents.get(ancestor)
+        return None
+
     def select_album(self):
         album_name = self.cfg["image"].get("album", "My Documents")
-        wanted = "".join(album_name.lower().split())
-        deadline = time.monotonic() + float(self.cfg["run"].get("timeout", 18))
-        last_page = "未知界面"
-        while time.monotonic() < deadline:
-            root = self.adb.dump_ui(timeout=UI_DUMP_TIMEOUT)
-            album = next((node for node in root.iter("node")
-                          if node_id(node) == "album_name" and rect(node)
-                          and wanted in "".join(node.get("text", "").lower().split())), None)
-            if album is not None:
-                self.adb.tap(*middle(album))
+        wanted = self.album_key(album_name)
+        if not wanted:
+            raise RuntimeError("请指定手机相册名")
+
+        seen_names = {}
+        previous_view = None
+        unchanged = 0
+        scrolls = 0
+        for root in self.ui_samples(time.monotonic() + self.timeout, 0.15):
+            entries = queries(root, ALBUM_IDS[0]) or queries(root, ALBUM_IDS[1])
+            visible = [(node, unicodedata.normalize("NFKC", node.get("text") or node.get("content-desc", "")))
+                       for node in entries]
+            if not visible:
+                continue
+            matches = []
+            for node, name in visible:
+                if name.strip() and len(seen_names) < 6:
+                    seen_names.setdefault(name.strip()[:60], None)
+                if wanted in (self.album_key(name), self.album_key(ALBUM_COUNT_SUFFIX.sub("", name))):
+                    matches.append(node)
+            if len(matches) > 1:
+                raise RuntimeError(f"手机上有重名相册「{album_name}」，无法确认要发送图片的相册")
+            if matches:
+                self.adb.tap(*middle(matches[0]))
                 return
-            if query(root, id="album_name") is not None:
-                last_page = "相册列表（目标相册未出现）"
-            elif query(root, id="editText_with_scrollbar") is not None:
-                last_page = "聊天界面"
-            elif query(root, id="rv_list") is not None:
-                last_page = "职位列表"
+
+            view = tuple((name, rect(node)) for node, name in visible)
+            if view == previous_view:
+                unchanged += 1
+                if unchanged >= 2:
+                    break
             else:
-                last_page = "非相册列表页面"
-            self.adb.wait(0.15)
-        raise UiTimeoutError(f"找不到手机相册：{album_name}；最后识别到：{last_page}")
+                unchanged = 0
+            previous_view = view
+
+            bounds = self.album_scroll_bounds(root, entries[0])
+            if bounds is not None:
+                if scrolls >= MAX_ALBUM_SCROLLS:
+                    break
+                self.adb.swipe_short(0.5, duration=300, bounds=bounds)
+                scrolls += 1
+
+        detail = "已识别到：" + "、".join(seen_names) if seen_names else "未识别到相册列表项"
+        raise UiTimeoutError(f"找不到手机相册「{album_name}」；{detail}")
 
     def select_image(self):
         # 相册只放一张图片的情况已实测；多图模式暂按可见顺序选择。
@@ -141,125 +256,176 @@ class Workflow:
             raise RuntimeError("当前界面找不到第 %d 张图片的勾选框" % (index + 1))
         self.adb.tap(*middle(checks[index]))
 
+    @staticmethod
+    def chat_without_picker(root):
+        return (query(root, id=CHAT_INPUT) is not None
+                and all(query(root, id=media_id) is None for media_id in MEDIA_IDS))
+
+    @staticmethod
+    def preview_confirm_button(root):
+        buttons = []
+        for node in queries(root, "button_apply"):
+            if node.get("enabled") == "false":
+                continue
+            if any(PREVIEW_CONFIRM_LABEL.fullmatch(unicodedata.normalize("NFKC", label).strip())
+                   for child in node.iter("node")
+                   for label in (child.get("text", ""), child.get("content-desc", ""))):
+                buttons.append(node)
+        return buttons[0] if len(buttons) == 1 else None
+
     def confirm_image(self):
         if self.cfg["image"].get("original", True):
             self.click("原图", id="originalLayout")
         self.click("顶部确定", id="button_preview")
-        self.click("预览页确定", id="button_apply", contains="确定")
-        self.wait_node("发送后聊天界面", id="editText_with_scrollbar")
+        for root in self.ui_samples(time.monotonic() + self.timeout, 0.15):
+            if self.chat_without_picker(root):
+                return False
+            button = self.preview_confirm_button(root)
+            if button is not None:
+                self.adb.tap(*middle(button))
+                self.log("已点击预览页确认发送")
+                break
+        else:
+            raise UiTimeoutError("等待超时：未出现可用的预览页确认按钮，也未回到聊天页")
+
+        for root in self.ui_samples(time.monotonic() + self.timeout, 0.15):
+            if self.chat_without_picker(root):
+                return True
+        raise UiTimeoutError("等待超时：确认发送后未回到聊天页")
 
     def send_image(self):
         self.open_attachment_menu()
         self.open_album_picker()
         self.select_album()
         self.select_image()
-        self.confirm_image()
+        return self.confirm_image()
 
-    def send_quick_phrase(self):
-        """接口预留：BOSS 常用语菜单尚未在本机验证，不猜测发送按键。"""
-        raise NotImplementedError("常用语需要先实测菜单结构，再接入点击函数")
-
-    def return_to_list(self, card):
-        self.adb.back()
-        self.adb.back()
-        self.recover_to_list(card)
-
-    def is_current_list(self, root, card):
-        """用当前职位卡片确认已回到原列表，避免详情页中的 rv_list 误判。"""
-        if query(root, id="rv_list") is None:
-            return False
-        return any(item["key"] == card["key"] for item in list_cards(root))
-
-    def recover_to_list(self, card):
-        """逐层返回，并在每次返回后确认原职位卡片确实出现在列表中。"""
-        deadline = time.monotonic() + max(30, float(self.cfg["run"].get("timeout", 18)) * 2)
-        for backs in range(MAX_RECOVERY_BACKS + 1):
-            if time.monotonic() >= deadline:
+    def recover_to_list(self, card, *, from_chat=False):
+        """已确认聊天页时直接返回，使用新抓取的列表核对原职位。"""
+        deadline = time.monotonic() + max(12, self.timeout)
+        backs = 0
+        checked_changed_list = False
+        check_chat_transition = from_chat
+        if from_chat:
+            self.adb.back()
+            backs = 1
+        for root in self.ui_samples(deadline, 0.15):
+            cards = self.job_list_cards(root)
+            if cards is not None:
+                if any(item["key"] == card["key"] for item in cards):
+                    return cards
+                if checked_changed_list:
+                    raise RuntimeError("返回后的职位列表已变化，无法确认原职位位置")
+                checked_changed_list = True
+                continue
+            checked_changed_list = False
+            in_chat = query(root, id=CHAT_INPUT) is not None
+            if check_chat_transition and in_chat:
+                # An in-flight transition or a dismissed keyboard can leave chat visible.
+                check_chat_transition = False
+                continue
+            if backs >= MAX_RECOVERY_BACKS:
                 break
-            for check in range(2):
-                root = self.adb.dump_ui(timeout=UI_DUMP_TIMEOUT)
-                if self.is_current_list(root, card):
-                    return
-                if check == 0 and time.monotonic() < deadline:
-                    self.adb.wait(0.5)
-            if backs < MAX_RECOVERY_BACKS and time.monotonic() < deadline:
-                self.log(f"恢复列表：返回第 {backs + 1} 次")
-                self.adb.back()
-        raise RuntimeError("限时返回后仍未确认职位列表，已停止投递")
+            self.adb.back()
+            backs += 1
+            check_chat_transition = in_chat
+        raise UiTimeoutError("限时返回后仍未确认职位列表，已停止投递")
+
+    def keyword_skip_reason(self, card):
+        filters = self.cfg.get("filters", {})
+        exclude_enabled = filters.get("exclude_enabled", False)
+        include_enabled = filters.get("include_enabled", False)
+        if not (exclude_enabled or include_enabled):
+            return None
+
+        texts = [text.casefold() for text in card["texts"]]
+        if exclude_enabled:
+            keyword = matching_keyword(filters.get("exclude_keywords", []), texts)
+            if keyword is not None:
+                return f"命中反向关键词「{keyword}」"
+        if include_enabled and matching_keyword(filters.get("include_keywords", []), texts) is None:
+            return "未命中正向关键词"
+        return None
 
     def apply_one(self, card):
         self.open_job(card)
 
-        # 非立即沟通：返回列表，标记跳过
-        if not self.send_greeting():
-            self.recover_to_list(card)
-
-            self.anchor = card["key"]
-            self.done.add(self.anchor)
-
+        button = self.greeting_button()
+        if button is None:
             self.log("已跳过：" + card["title"])
             return False
 
-        # 正常投递流程
-        if self.cfg["actions"].get("quick_phrase"):
-            self.send_quick_phrase()
-
-        if self.cfg["actions"].get("image", True):
-            try:
-                self.send_image()
-            except (UiTimeoutError, AdbTimeoutError) as exc:
-                self.log(f"打招呼后流程超时：{exc}；尝试返回职位列表")
-                try:
-                    self.recover_to_list(card)
-                except RuntimeError as recovery_exc:
-                    raise RuntimeError(
-                        f"原流程超时：{exc}；恢复列表失败：{recovery_exc}"
-                    ) from recovery_exc
-                self.anchor = card["key"]
-                self.done.add(self.anchor)
-                self.log("已返回列表；当前职位的图片发送结果未确认")
-                return None
-
-        self.return_to_list(card)
-
-        self.anchor = card["key"]
-        self.done.add(self.anchor)
+        # 点击立即沟通会触发平台自动发送招呼语。
+        self.log("正在点击立即沟通：" + card["title"])
+        try:
+            self.adb.tap(*middle(button))
+            self.wait_node("聊天输入框", id=CHAT_INPUT)
+        except (UiTimeoutError, AdbTimeoutError) as exc:
+            self.log(f"确认招呼时超时：{exc}，当前职位的招呼结果待确认")
+            return None
+        except (RuntimeError, InterruptedError):
+            self.log("当前职位的招呼结果待确认，请在手机上核对")
+            raise
 
         return True
 
     def run(self):
+        self.validate_config(self.cfg)
         limit = int(self.cfg["run"].get("limit", 2))
-
-        if self.cfg["actions"].get("quick_phrase"):
-            raise RuntimeError("常用语功能暂未完成实机验证，请先关闭该选项")
-
-        self.wait_node("首页职位列表", id="rv_list")
 
         success = 0
         skipped = 0
         unconfirmed = 0
+        recovered_cards = None
 
-        # 只有成功投递才占用名额
-        while success < limit:
+        while success + unconfirmed < limit:
             self.adb.check_stop()
 
-            card = self.next_card()
+            card = self.next_card(recovered_cards)
+            recovered_cards = None
+            if card is None:
+                self.log("达到最大短滑次数，未发现下一张完整职位")
+                break
             self.log(
                 f"正在检查：{card['title']} | "
-                f"已成功 {success}/{limit}"
+                f"已用名额 {success + unconfirmed}/{limit}"
             )
 
-            result = self.apply_one(card)
+            reason = self.keyword_skip_reason(card)
+            if reason is None:
+                result = self.apply_one(card)
+            else:
+                self.log(f"已跳过：{card['title']}（{reason}）")
+                result = False
+
+            self.anchor = card["key"]
+            self.done.add(self.anchor)
+            from_chat = False
             if result is True:
                 success += 1
                 self.progress(success, card["title"])
-                self.log(f"成功投递：{success}/{limit}")
+                self.log(f"招呼已确认，成功投递：{success}/{limit}")
+                from_chat = True
+                if self.cfg["actions"].get("image", False):
+                    try:
+                        confirmed = self.send_image()
+                    except (RuntimeError, ValueError) as exc:
+                        from_chat = False
+                        self.log(f"简历图片未确认：{exc}（招呼已计入成功）")
+                    else:
+                        if confirmed:
+                            self.log("简历图片发送流程完成，已回到聊天页")
+                        else:
+                            self.log("顶部确认后已回到聊天页，简历图片送达待核对")
             elif result is False:
                 skipped += 1
                 self.log(f"已跳过 {skipped} 个职位，不占用投递名额")
             else:
                 unconfirmed += 1
-                self.log(f"已打招呼但图片结果未确认 {unconfirmed} 个，不占成功名额")
+                self.log(f"招呼结果待确认 {unconfirmed} 个，已计入投递上限")
+
+            if reason is None:
+                recovered_cards = self.recover_to_list(card, from_chat=from_chat)
 
         self.log(
             f"本轮完成：成功投递 {success} 个，"

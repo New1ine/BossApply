@@ -2,13 +2,24 @@
 import re
 
 
+_BOUNDS = re.compile(r"\[([0-9]{1,10}),([0-9]{1,10})\]\[([0-9]{1,10}),([0-9]{1,10})\]")
+
+
 def rect(node):
-    numbers = re.findall(r"\d+", node.get("bounds", ""))
-    return tuple(map(int, numbers)) if len(numbers) == 4 else None
+    match = _BOUNDS.fullmatch(node.get("bounds", ""))
+    if match is None:
+        return None
+    x1, y1, x2, y2 = map(int, match.groups())
+    if x1 < x2 and y1 < y2:
+        return x1, y1, x2, y2
+    return None
 
 
 def middle(node):
-    x1, y1, x2, y2 = rect(node)
+    bounds = rect(node)
+    if bounds is None:
+        raise ValueError("控件坐标无效，无法点击")
+    x1, y1, x2, y2 = bounds
     return (x1 + x2) // 2, (y1 + y2) // 2
 
 
@@ -39,29 +50,39 @@ def list_cards(root, min_fraction=0.18):
     lst = query(root, id="rv_list")
     if lst is None:
         raise RuntimeError("不是职位列表页面，需先在手机进入已筛选的岗位首页")
-    lx1, top, lx2, bottom = rect(lst)
-    parents = {child: parent for parent in root.iter() for child in parent}
-    cards, seen = [], set()
+    left, top, right, bottom = rect(lst)
+    parents = {child: parent for parent in lst.iter() for child in parent}
+    cards = {}
     for node in lst.iter("node"):
         if node_id(node) != "tv_position_name":
             continue
         parent = node
-        while parent in parents and parent.get("clickable") != "true":
+        while parent is not lst and parent.get("clickable") != "true":
             parent = parents[parent]
+        if parent is lst:
+            continue
         bounds = rect(parent)
         if bounds is None:
             continue
         title = node.get("text", "").replace(" &@ ", "").strip()
+        if not title:
+            continue
         company = next((n.get("text", "").strip() for n in parent.iter("node")
                        if node_id(n) == "tv_company_name"), "")
         key = (title, company)
-        if key in seen:
-            continue
-        seen.add(key)
         x1, y1, x2, y2 = bounds
-        cards.append({
-            "key": key, "title": title, "company": company, "bounds": bounds,
-            "complete": bool(company) and y1 >= top and y2 <= bottom
-                        and (y2 - y1) >= (bottom - top) * min_fraction,
-        })
-    return sorted(cards, key=lambda c: c["bounds"][1])
+        complete = (bool(company) and left <= x1 < x2 <= right and top <= y1 < y2 <= bottom
+                    and (y2 - y1) >= (bottom - top) * min_fraction)
+        if key in cards and (cards[key]["complete"] or not complete):
+            continue
+        texts = [title]
+        for child in parent.iter("node"):
+            if child is not node and (text := child.get("text")):
+                texts.append(text)
+            if description := child.get("content-desc"):
+                texts.append(description)
+        cards[key] = {
+            "key": key, "title": title, "company": company, "bounds": bounds, "texts": texts,
+            "complete": complete,
+        }
+    return sorted(cards.values(), key=lambda c: c["bounds"][1])
