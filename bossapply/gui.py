@@ -38,19 +38,15 @@ ACCENT = "#2563EB"
 BORDER = "#E5E9F0"
 
 
-class KeywordFilter(ctk.CTkFrame):
-    def __init__(self, parent, label, hint):
+class TagEditor(ctk.CTkFrame):
+    def __init__(self, parent, placeholder, parse_value=str):
         super().__init__(parent, fg_color="transparent")
-        self.enabled = tk.BooleanVar(master=self)
         self.chips = {}
-        ctk.CTkCheckBox(self, text=label, variable=self.enabled, text_color=TEXT,
-                        fg_color=ACCENT).pack(anchor="w")
-        ctk.CTkLabel(self, text=hint, text_color=MUTED,
-                     font=ctk.CTkFont(size=13)).pack(anchor="w", pady=(2, 4))
+        self.parse_value = parse_value
 
         row = ctk.CTkFrame(self, fg_color="transparent")
         row.pack(fill="x")
-        self.entry = ctk.CTkEntry(row, width=90, height=34, placeholder_text="输入关键词",
+        self.entry = ctk.CTkEntry(row, width=90, height=34, placeholder_text=placeholder,
                                   border_color=BORDER, fg_color=WHITE, text_color=TEXT)
         self.entry.pack(side="left", fill="x", expand=True, padx=(0, 7))
         self.entry.bind("<Return>", self.add_entry)
@@ -58,37 +54,44 @@ class KeywordFilter(ctk.CTkFrame):
                       hover_color="#D9E7FF", text_color=ACCENT,
                       command=self.add_entry).pack(side="right")
 
-        self.tags = tk.Frame(self, bg=WHITE, height=1)
-        self.tags.pack(fill="x", pady=(7, 0))
-        self.tags.bind("<Configure>", self._layout_tags)
+        self.tag_area = tk.Frame(self, bg=WHITE, height=1)
+        self.tag_area.pack(fill="x", pady=(7, 0))
+        self.tag_area.bind("<Configure>", self._layout_tags)
 
     def add_entry(self, event=None):
-        self.add_keyword(self.entry.get())
+        try:
+            self.commit_entry()
+        except ValueError as err:
+            messagebox.showerror("配置无效", str(err), parent=self.winfo_toplevel())
+
+    def commit_entry(self):
+        value = self.entry.get().strip()
+        if value:
+            self.add_tag(self.parse_value(value))
         self.entry.delete(0, "end")
 
-    def add_keyword(self, keyword):
-        keyword = keyword.strip()
-        key = keyword.casefold()
-        if not key or key in self.chips:
+    def add_tag(self, value):
+        key = str(value).casefold()
+        if key in self.chips:
             return
-        chip = tk.Button(self.tags, text=f"{keyword}  ×", font=(FONT_FAMILY, 10),
+        chip = tk.Button(self.tag_area, text=f"{value}  ×", font=(FONT_FAMILY, 10),
                          bg="#EAF1FF", activebackground="#D9E7FF", fg=ACCENT,
                          activeforeground=ACCENT, relief="flat", borderwidth=0,
                          highlightthickness=0, padx=8, pady=3, cursor="hand2",
-                         command=lambda: self._remove_keyword(key))
-        self.chips[key] = (keyword, chip)
+                         command=lambda: self._remove_tag(key))
+        self.chips[key] = (value, chip)
         self._layout_tags()
 
-    def _remove_keyword(self, key):
+    def _remove_tag(self, key):
         _, chip = self.chips.pop(key)
         chip.destroy()
         self._layout_tags()
 
-    def keywords(self):
-        return [keyword for keyword, _ in self.chips.values()]
+    def values(self):
+        return [value for value, _ in self.chips.values()]
 
     def _layout_tags(self, event=None):
-        width = self.tags.winfo_width()
+        width = self.tag_area.winfo_width()
         if width <= 1:
             return
         x = y = row_height = 0
@@ -101,12 +104,33 @@ class KeywordFilter(ctk.CTkFrame):
             chip.place(x=x, y=y, width=chip_width)
             x += chip_width + 5
             row_height = max(row_height, chip_height)
-        self.tags.configure(height=max(1, y + row_height))
+        self.tag_area.configure(height=max(1, y + row_height))
+
+
+class KeywordFilter(ctk.CTkFrame):
+    def __init__(self, parent, label, hint):
+        super().__init__(parent, fg_color="transparent")
+        self.enabled = tk.BooleanVar(master=self)
+        ctk.CTkCheckBox(self, text=label, variable=self.enabled, text_color=TEXT,
+                        fg_color=ACCENT).pack(anchor="w")
+        ctk.CTkLabel(self, text=hint, text_color=MUTED,
+                     font=ctk.CTkFont(size=13)).pack(anchor="w", pady=(2, 4))
+        self.tags = TagEditor(self, "输入关键词")
+        self.tags.pack(fill="x")
+
+
+def _photo_index(value):
+    try:
+        if value.isdecimal() and (index := int(value)) > 0:
+            return index
+    except ValueError:
+        pass
+    raise ValueError("照片序号必须是大于 0 的整数")
 
 
 class Desktop(ctk.CTk):
     def __init__(self, cfg=None):
-        cfg = read_config() if cfg is None else cfg
+        cfg = read_config() if cfg is None else normalize_config(cfg)
         super().__init__(fg_color=BG)
         self.title("BossApply")
         self.geometry("770x790")
@@ -246,7 +270,7 @@ class Desktop(ctk.CTk):
 
         filters = self._card(content)
         self._header(filters, "关键词筛选")
-        ctk.CTkLabel(filters, text="匹配职位卡片上的文字，优先执行反向筛选。",
+        ctk.CTkLabel(filters, text="匹配职位卡片文字。两者都开时，从正向命中的职位中剔除反向命中的职位。",
                      text_color=MUTED, font=ctk.CTkFont(size=13)).pack(anchor="w", padx=18, pady=(0, 9))
         row = ctk.CTkFrame(filters, fg_color="transparent")
         row.pack(fill="x", padx=18, pady=(0, 14))
@@ -263,7 +287,7 @@ class Desktop(ctk.CTk):
         ctk.CTkLabel(send, text="默认招呼语（点击立即沟通后由 BOSS 自动发送）", text_color=MUTED,
                      font=ctk.CTkFont(size=14)).pack(anchor="w", padx=18, pady=(0, 8))
         self.image_enabled = tk.BooleanVar(value=False)
-        image_switch = ctk.CTkSwitch(send, text="同时发送简历图片", variable=self.image_enabled,
+        image_switch = ctk.CTkSwitch(send, text="招呼后发送图片", variable=self.image_enabled,
                                      onvalue=True, offvalue=False, progress_color=ACCENT,
                                      text_color=TEXT, command=self._image_fields_toggle)
         image_switch.pack(anchor="w", padx=18, pady=(0, 11))
@@ -272,7 +296,10 @@ class Desktop(ctk.CTk):
         line = ctk.CTkFrame(self.image_area, fg_color="transparent")
         line.pack(fill="x")
         self.album = self._entry(line, "手机相册名", width=210)
-        self.index = self._entry(line, "第几张", width=90)
+        ctk.CTkLabel(self.image_area, text="相册可见照片从左到右、从上到下编号，按标签添加顺序勾选。",
+                     text_color=MUTED, font=ctk.CTkFont(size=13)).pack(anchor="w", pady=(8, 4))
+        self.photo_indices = TagEditor(self.image_area, "输入照片序号，如 2", parse_value=_photo_index)
+        self.photo_indices.pack(fill="x", padx=(0, 12))
         self.original = tk.BooleanVar(value=True)
         ctk.CTkCheckBox(self.image_area, text="原图发送", variable=self.original,
                         text_color=TEXT, width=115, height=24).pack(anchor="w", pady=(11, 0))
@@ -339,18 +366,20 @@ class Desktop(ctk.CTk):
         for variable, value in (
             (self.limit, c['run']['limit']), (self.delay, c['device']['click_interval']),
             (self.timeout, c['run']['timeout']), (self.album, c['image']['album']),
-            (self.index, c['image']['index']), (self.port, c['device']['port']),
+            (self.port, c['device']['port']),
             (self.adb_path, c['device']['path']), (self.scroll, c['run']['scroll_fraction']),
             (self.scroll_attempts, c['run']['max_scroll_attempts']),
         ):
             variable.set(str(value))
         self.image_enabled.set(bool(c['actions']['image']))
         self.original.set(bool(c['image']['original']))
+        for index in c['image']['indices']:
+            self.photo_indices.add_tag(index)
         self._image_fields_toggle()
-        for kind, editor in self.keyword_filters.items():
-            editor.enabled.set(bool(c['filters'][f'{kind}_enabled']))
+        for kind, keyword_filter in self.keyword_filters.items():
+            keyword_filter.enabled.set(bool(c['filters'][f'{kind}_enabled']))
             for keyword in c['filters'][f'{kind}_keywords']:
-                editor.add_keyword(keyword)
+                keyword_filter.tags.add_tag(keyword)
 
     def _image_fields_toggle(self):
         if self.image_enabled.get():
@@ -528,12 +557,13 @@ class Desktop(ctk.CTk):
         cfg['actions']['image'] = bool(self.image_enabled.get())
         cfg['actions']['quick_phrase'] = False
         if cfg['actions']['image']:
+            self.photo_indices.commit_entry()
             cfg['image'].update(album=self.album.get().strip() or 'My Documents',
-                                index=self.index.get(), original=bool(self.original.get()))
-        for kind, editor in self.keyword_filters.items():
-            editor.add_entry()
-            cfg['filters'][f'{kind}_enabled'] = editor.enabled.get()
-            cfg['filters'][f'{kind}_keywords'] = editor.keywords()
+                                indices=self.photo_indices.values(), original=bool(self.original.get()))
+        for kind, keyword_filter in self.keyword_filters.items():
+            keyword_filter.tags.commit_entry()
+            cfg['filters'][f'{kind}_enabled'] = keyword_filter.enabled.get()
+            cfg['filters'][f'{kind}_keywords'] = keyword_filter.tags.values()
         return normalize_config(cfg)
 
     def save(self, quiet=False):

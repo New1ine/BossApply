@@ -220,6 +220,60 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(adb.scroll_calls, 2)
         self.assertEqual(adb.taps, [])
 
+    def test_image_tags_select_visible_grid_positions_in_tag_order_and_confirm_once(self):
+        grid = screen(
+            '<node resource-id="media_thumbnail" bounds="[0,100][100,200]"/>'
+            '<node resource-id="check_view" bounds="[60,200][100,240]"/>'
+            '<node resource-id="check_view" bounds="[160,100][200,140]"/>'
+            '<node resource-id="check_view" bounds="[60,100][100,140]"/>'
+        )
+        top = screen('<node resource-id="button_preview" text="确定（2/9）" bounds="[300,800][500,880]"/>')
+        preview = screen('<node resource-id="button_apply" text="发送（2张）" bounds="[300,850][500,930]"/>')
+        chat = screen('<node resource-id="editText_with_scrollbar" bounds="[0,950][500,990]"/>')
+        adb = FakeAdb(grid, top, preview, chat)
+        workflow = self.workflow(adb, image={"indices": [3, 1], "index": 2, "original": False})
+        with (patch.object(workflow, "open_attachment_menu"),
+              patch.object(workflow, "open_album_picker"), patch.object(workflow, "select_album")):
+            self.assertTrue(workflow.send_image())
+        self.assertEqual(adb.taps, [(80, 220), (80, 120), (400, 840), (400, 890)])
+
+    def test_legacy_image_index_and_default_each_select_one_photo(self):
+        grid = screen(
+            '<node resource-id="media_thumbnail" bounds="[0,100][100,200]"/>'
+            '<node resource-id="check_view" bounds="[60,100][100,140]"/>'
+            '<node resource-id="check_view" bounds="[160,100][200,140]"/>'
+        )
+        for image, tap in (({}, (80, 120)), ({"index": "2"}, (180, 120))):
+            with self.subTest(image=image):
+                adb = FakeAdb(grid)
+                self.workflow(adb, image=image).select_image()
+                self.assertEqual(adb.taps, [tap])
+
+    def test_image_selection_validates_all_requested_controls_before_tapping(self):
+        grid = screen(
+            '<node resource-id="media_thumbnail" bounds="[0,100][100,200]"/>'
+            '<node resource-id="check_view" bounds="[60,100][100,140]"/>'
+            '<node resource-id="check_view" enabled="false" bounds="[160,100][200,140]"/>'
+        )
+        for indices, message in (([1, 2], "第 2 张图片不可勾选"), ([1, 3], "找不到第 3 张图片")):
+            with self.subTest(indices=indices):
+                adb = FakeAdb(grid)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self.workflow(adb, image={"indices": indices}).select_image()
+                self.assertEqual(adb.taps, [])
+
+    def test_multiselect_stops_before_a_confirmation_with_the_wrong_visible_count(self):
+        mismatch = ' text="确定（1/9）"'
+        for top_count, preview_count, expected_taps in ((mismatch, "", []), ("", mismatch, [(400, 840)])):
+            with self.subTest(top_count=top_count, preview_count=preview_count):
+                top = screen(f'<node resource-id="button_preview"{top_count} bounds="[300,800][500,880]"/>')
+                preview = screen(f'<node resource-id="button_apply"{preview_count} bounds="[300,850][500,930]"/>')
+                adb = FakeAdb(top, preview)
+                workflow = self.workflow(adb, image={"indices": [1, 2], "original": False})
+                with self.assertRaisesRegex(RuntimeError, "已选 1 张图片，配置要求 2 张"):
+                    workflow.confirm_image()
+                self.assertEqual(adb.taps, expected_taps)
+
     def test_preview_waits_for_enabled_controls_and_accepts_send_label_once(self):
         top_disabled = screen('<node resource-id="button_preview" enabled="false" bounds="[100,800][300,880]"/>')
         top = screen('<node resource-id="button_preview" enabled="true" bounds="[300,800][500,880]"/>')
@@ -347,7 +401,7 @@ class WorkflowTests(unittest.TestCase):
         send_image.assert_called_once()
         self.assertEqual(len(adb.taps), 2)
         self.assertEqual(adb.back_calls, 1)
-        workflow.log.assert_any_call("简历图片未确认：找不到手机相册（招呼已计入成功）")
+        workflow.log.assert_any_call("图片未确认：找不到手机相册（招呼已计入成功）")
         workflow.log.assert_any_call("本轮完成：成功投递 1 个，跳过 0 个，结果未确认 0 个，共检查 1 个职位")
 
     def test_stop_during_attachment_keeps_the_already_confirmed_greeting(self):

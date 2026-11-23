@@ -19,7 +19,8 @@ ALBUM_COUNT_SUFFIX = re.compile(
     r'(?:\s*\(\s*[0-9]+(?:,[0-9]{3})*\s*(?:张|项|个)?\s*\)|\s+[0-9]+(?:,[0-9]{3})*\s*(?:张|项|个))\s*$'
 )
 PREVIEW_CONFIRM_LABEL = re.compile(
-    r"(?:确定|确认|发送|确认发送|确定发送)(?:\s*\(\s*[1-9][0-9]*(?:\s*/\s*[0-9]+|\s*张)?\s*\))?"
+    r"(?:确定|确认|发送|确认发送|确定发送)"
+    r"(?:\s*\(\s*(?P<count>[1-9][0-9]*)(?:\s*/\s*[0-9]+|\s*张)?\s*\))?"
 )
 
 
@@ -36,6 +37,30 @@ def matching_keyword(keywords, texts):
     return None
 
 
+def _image_indices(config):
+    image = config.get("image", {})
+    if "indices" in image:
+        indices = image["indices"]
+    else:
+        try:
+            indices = [int(image.get("index", 1))]
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("图片序号必须是大于 0 的整数") from None
+    if not isinstance(indices, list) or not indices:
+        raise ValueError("请至少添加一个图片序号")
+    if any(type(index) is not int or index < 1 for index in indices):
+        raise ValueError("图片序号必须是大于 0 的整数")
+    return list(dict.fromkeys(indices))
+
+
+def _confirmation_label_matches(button):
+    for child in button.iter("node"):
+        for attribute in ("text", "content-desc"):
+            label = unicodedata.normalize("NFKC", child.get(attribute, "")).strip()
+            if match := PREVIEW_CONFIRM_LABEL.fullmatch(label):
+                yield match
+
+
 class Workflow:
     def __init__(self, client, config, log=lambda s: None, progress=lambda n, s: None):
         self.adb = client
@@ -50,6 +75,8 @@ class Workflow:
     def validate_config(config):
         if config["actions"].get("quick_phrase"):
             raise ValueError("常用语功能暂未完成实机验证，请先关闭该选项")
+        if config["actions"].get("image"):
+            _image_indices(config)
         filters = config.get("filters", {})
         if filters.get("include_enabled") and not any(
             keyword.strip() for keyword in filters.get("include_keywords", [])
@@ -248,13 +275,19 @@ class Workflow:
         raise UiTimeoutError(f"找不到手机相册「{album_name}」；{detail}")
 
     def select_image(self):
-        # 相册只放一张图片的情况已实测；多图模式暂按可见顺序选择。
+        indices = _image_indices(self.cfg)
         _, root = self.wait_node("图片缩略图", id="media_thumbnail", with_root=True)
         checks = sorted(queries(root, "check_view"), key=lambda n: (rect(n)[1], rect(n)[0]))
-        index = int(self.cfg["image"].get("index", 1)) - 1
-        if index < 0 or index >= len(checks):
-            raise RuntimeError("当前界面找不到第 %d 张图片的勾选框" % (index + 1))
-        self.adb.tap(*middle(checks[index]))
+        targets = []
+        for index in indices:
+            if index > len(checks):
+                raise RuntimeError(f"当前界面找不到第 {index} 张图片的勾选框")
+            node = checks[index - 1]
+            if node.get("enabled") == "false":
+                raise RuntimeError(f"当前界面第 {index} 张图片不可勾选")
+            targets.append(middle(node))
+        for point in targets:
+            self.adb.tap(*point)
 
     @staticmethod
     def chat_without_picker(root):
@@ -262,26 +295,38 @@ class Workflow:
                 and all(query(root, id=media_id) is None for media_id in MEDIA_IDS))
 
     @staticmethod
+    def _check_multiselect_count(button, expected):
+        if expected == 1:
+            return
+        counts = {int(match["count"]) for match in _confirmation_label_matches(button) if match["count"]}
+        if counts and counts != {expected}:
+            shown = "、".join(str(count) for count in sorted(counts))
+            raise RuntimeError(f"手机显示已选 {shown} 张图片，配置要求 {expected} 张")
+
+    @staticmethod
     def preview_confirm_button(root):
         buttons = []
         for node in queries(root, "button_apply"):
             if node.get("enabled") == "false":
                 continue
-            if any(PREVIEW_CONFIRM_LABEL.fullmatch(unicodedata.normalize("NFKC", label).strip())
-                   for child in node.iter("node")
-                   for label in (child.get("text", ""), child.get("content-desc", ""))):
+            if any(_confirmation_label_matches(node)):
                 buttons.append(node)
         return buttons[0] if len(buttons) == 1 else None
 
     def confirm_image(self):
+        expected_count = len(_image_indices(self.cfg))
         if self.cfg["image"].get("original", True):
             self.click("原图", id="originalLayout")
-        self.click("顶部确定", id="button_preview")
+        top = self.wait_node("顶部确定", id="button_preview", require_enabled=True)
+        self._check_multiselect_count(top, expected_count)
+        self.adb.tap(*middle(top))
+        self.log("点击：顶部确定")
         for root in self.ui_samples(time.monotonic() + self.timeout, 0.15):
             if self.chat_without_picker(root):
                 return False
             button = self.preview_confirm_button(root)
             if button is not None:
+                self._check_multiselect_count(button, expected_count)
                 self.adb.tap(*middle(button))
                 self.log("已点击预览页确认发送")
                 break
@@ -411,12 +456,12 @@ class Workflow:
                         confirmed = self.send_image()
                     except (RuntimeError, ValueError) as exc:
                         from_chat = False
-                        self.log(f"简历图片未确认：{exc}（招呼已计入成功）")
+                        self.log(f"图片未确认：{exc}（招呼已计入成功）")
                     else:
                         if confirmed:
-                            self.log("简历图片发送流程完成，已回到聊天页")
+                            self.log("图片发送流程完成，已回到聊天页")
                         else:
-                            self.log("顶部确认后已回到聊天页，简历图片送达待核对")
+                            self.log("顶部确认后已回到聊天页，图片送达待核对")
             elif result is False:
                 skipped += 1
                 self.log(f"已跳过 {skipped} 个职位，不占用投递名额")

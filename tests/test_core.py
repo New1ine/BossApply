@@ -21,12 +21,14 @@ class ConfigTests(unittest.TestCase):
         self.enterContext(patch.object(core, 'CONFIG_PATH', self.path))
 
     def test_missing_config_defaults_to_no_image(self):
-        self.assertFalse(core.read_config()['actions']['image'])
+        cfg = core.read_config()
+        self.assertFalse(cfg['actions']['image'])
+        self.assertEqual(cfg['image']['indices'], [1])
         self.assertFalse(self.path.exists())
 
     def test_partial_legacy_config_preserves_values_and_normalizes_filters(self):
         self.path.write_text(
-            '{"run":{"limit":"7"}, "actions":{"image":true},'
+            '{"run":{"limit":"7"}, "actions":{"image":true}, "image":{"index":"3"},'
             ' "filters":{"exclude_enabled":"false","include_keywords":[" Python ", "PYTHON", ""]},'
             ' "extra":{"keep":1}}',
             encoding='utf-8-sig',
@@ -34,10 +36,18 @@ class ConfigTests(unittest.TestCase):
         cfg = core.read_config()
         self.assertEqual(cfg['run']['limit'], 7)
         self.assertTrue(cfg['actions']['image'])
+        self.assertEqual(cfg['image']['indices'], [3])
+        self.assertNotIn('index', cfg['image'])
         self.assertFalse(cfg['filters']['exclude_enabled'])
         self.assertEqual(cfg['filters']['include_keywords'], ['Python'])
         core.write_config(cfg)
         self.assertEqual(core.read_config(), cfg)
+
+    def test_image_indices_keep_tag_order_and_round_trip(self):
+        core.write_config({'actions': {'image': True}, 'image': {'indices': ['3', 1, 3], 'index': 2}})
+        self.assertEqual(core.read_config()['image'], {
+            'album': 'My Documents', 'indices': [3, 1], 'original': True,
+        })
 
     def test_invalid_config_is_rejected_without_modifying_original(self):
         malformed = (
@@ -45,6 +55,9 @@ class ConfigTests(unittest.TestCase):
             b'{"run":{"limit":1.5}}', b'{"device":{"click_interval":NaN}}',
             b'{"actions":{"image":"yes"}}', b'{"filters":{"exclude_keywords":"Python"}}',
             b'{"filters":{"include_keywords":[null]}}', b'\xff',
+            b'{"image":{"index":null}}', b'{"image":{"indices":2}}',
+            b'{"image":{"indices":[true]}}', b'{"image":{"indices":[0]}}',
+            b'{"actions":{"image":true},"image":{"indices":[]}}',
         )
         for raw in malformed:
             with self.subTest(raw=raw):

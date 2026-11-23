@@ -25,7 +25,7 @@ DEFAULTS = {
     'device': {'path': 'auto', 'port': 0, 'serial': 'auto', 'click_interval': 0.15},
     'run': {'limit': 20, 'timeout': 18, 'scroll_fraction': 0.145, 'max_scroll_attempts': 20},
     'actions': {'image': False, 'quick_phrase': False},
-    'image': {'album': 'My Documents', 'index': 1, 'original': True},
+    'image': {'album': 'My Documents', 'indices': [1], 'original': True},
     'filters': {'exclude_enabled': False, 'exclude_keywords': [],
                 'include_enabled': False, 'include_keywords': []},
 }
@@ -86,7 +86,6 @@ def normalize_config(data):
         (run, 'timeout', int, '页面等待上限（3～120 秒）', lambda n: 3 <= n <= 120),
         (run, 'scroll_fraction', float, '短滑屏幕比例（大于 0 且小于 1）', lambda n: 0 < n < 1),
         (run, 'max_scroll_attempts', int, '最大短滑次数（1～100）', lambda n: 1 <= n <= 100),
-        (image, 'index', int, '图片序号（至少为 1）', lambda n: n >= 1),
     )
     for section, key, convert, field, valid in numeric_fields:
         section[key] = _number(section[key], convert, field, valid)
@@ -100,9 +99,22 @@ def normalize_config(data):
             raise ValueError(f'{field}必须是非空文本')
         section[key] = value
 
-    cfg['actions']['image'] = _boolean(cfg['actions']['image'], '发送简历图片')
+    cfg['actions']['image'] = _boolean(cfg['actions']['image'], '发送图片')
     cfg['actions']['quick_phrase'] = _boolean(cfg['actions']['quick_phrase'], '发送快捷语')
     image['original'] = _boolean(image['original'], '发送原图')
+    if 'index' in image:
+        legacy_index = image.pop('index')
+        if 'indices' not in data['image']:
+            image['indices'] = [legacy_index]
+    indices = image['indices']
+    if not isinstance(indices, list):
+        raise ValueError('图片序号必须是列表')
+    if cfg['actions']['image'] and not indices:
+        raise ValueError('开启发送图片后，请至少添加一个图片序号')
+    image['indices'] = list(dict.fromkeys(
+        _number(index, int, '图片序号（至少为 1）', lambda n: n >= 1) for index in indices
+    ))
+
     filters = cfg['filters']
     for kind, field in (('exclude', '反向筛选'), ('include', '正向筛选')):
         enabled_key, keywords_key = f'{kind}_enabled', f'{kind}_keywords'
