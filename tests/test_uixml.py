@@ -30,7 +30,12 @@ class UiXmlTests(unittest.TestCase):
                 <node clickable="true" bounds="[10,140][490,250]">
                     <node resource-id="id/tv_position_name" text="职位 A" />
                     <node resource-id="id/tv_company_name" text="公司 A" />
-                    <node text="薪资" content-desc="远程" />
+                    <node resource-id="id/tv_salary_statue" text="250-300元/天" bounds="[320,145][450,170]" />
+                    <node resource-id="id/fl_require_info" bounds="[30,175][300,205]">
+                        <node text="本科" bounds="[30,175][100,195]" />
+                        <node content-desc="C++" bounds="[100,175][180,195]" />
+                    </node>
+                    <node text="100-499人" content-desc="远程" />
                 </node>
                 <node clickable="true" bounds="[0,260][510,400]">
                     <node resource-id="id/tv_position_name" text="横向裁切" />
@@ -43,5 +48,7 @@ class UiXmlTests(unittest.TestCase):
         self.assertEqual([card['title'] for card in cards], ['职位 A', '横向裁切'])
         self.assertTrue(cards[0]['complete'])
         self.assertEqual(cards[0]['bounds'], (10, 140, 490, 250))
-        self.assertEqual(cards[0]['texts'], ['职位 A', '公司 A', '薪资', '远程'])
+        self.assertEqual(cards[0]['salary'], '250-300元/天')
+        self.assertEqual(cards[0]['requirements'], ['本科', 'C++'])
+        self.assertEqual(cards[0]['texts'], ['职位 A', '公司 A', '250-300元/天', '本科', 'C++', '100-499人', '远程'])
         self.assertFalse(cards[1]['complete'])

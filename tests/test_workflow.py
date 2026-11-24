@@ -1,9 +1,15 @@
+import contextlib
+import io
+import tempfile
 import unittest
 from collections import deque
+from pathlib import Path
 from unittest.mock import Mock, patch
 from xml.etree import ElementTree
 
+from bossapply import core
 from bossapply.engine.adb_client import AdbTimeoutError, TransientUiDumpError, UiDumpError
+from bossapply.engine.uixml import list_cards
 from bossapply.engine.workflow import BOSS_PACKAGE, UiTimeoutError, Workflow
 
 
@@ -26,6 +32,17 @@ def card(title="开发工程师", company="测试公司", bounds="[0,200][500,45
 
 def listing(contents):
     return screen(f'<node resource-id="rv_list" bounds="[0,100][500,900]">{contents}</node>')
+
+
+def quota_reminder(message="您今天已与120位BOSS沟通，还剩30次沟通机会哦", *, enabled="true"):
+    return screen(
+        '<node resource-id="tv_title" text="温馨提示" bounds="[50,350][450,400]"/>'
+        f'<node resource-id="tv_desc_out" text="{message}" bounds="[50,420][450,500]"/>'
+        '<node resource-id="btn_container_view" bounds="[40,500][460,650]">'
+        '<node resource-id="ll_buttons" bounds="[45,510][455,630]">'
+        f'<node text="好" clickable="true" enabled="{enabled}" bounds="[50,520][450,620]"/>'
+        '</node></node>'
+    )
 
 
 class FakeAdb:
@@ -77,12 +94,88 @@ class WorkflowTests(unittest.TestCase):
 
     def test_empty_include_filter_fails_before_adb(self):
         adb = FakeAdb()
-        workflow = self.workflow(adb, filters={"include_enabled": True, "include_keywords": ["  "]})
-        with patch.object(adb, "check_stop") as check_stop, self.assertRaisesRegex(ValueError, "至少添加一个关键词"):
-            workflow.run()
+        for prefix in ("", "require_"):
+            with self.subTest(prefix=prefix):
+                settings = {f"{prefix}include_enabled": True, f"{prefix}include_keywords": ["  "]}
+                workflow = self.workflow(adb, filters=settings)
+                with (patch.object(adb, "check_stop") as check_stop,
+                      self.assertRaisesRegex(ValueError, "至少添加一个关键词")):
+                    workflow.run()
+                check_stop.assert_not_called()
 
-        check_stop.assert_not_called()
         self.assertEqual(adb.dump_timeouts, [])
+
+    def test_title_and_requirement_keywords_match_only_the_selected_field(self):
+        embedded = list_cards(listing(card(title="嵌入式软件开发工程师", extra=(
+            '<node resource-id="fl_require_info" bounds="[10,300][300,360]">'
+            '<node text="C++" bounds="[10,300][70,340]"/></node>'
+        ))))[0]
+        cases = (
+            ({"exclude_enabled": True, "exclude_keywords": ["c++"]}, False),
+            ({"require_exclude_enabled": True, "require_exclude_keywords": ["c++"]}, True),
+            ({"include_enabled": True, "include_keywords": ["c++"]}, True),
+            ({"require_include_enabled": True, "require_include_keywords": ["c++"]}, False),
+            ({"include_enabled": True, "include_keywords": ["嵌入式"],
+              "require_include_enabled": True, "require_include_keywords": ["Rust"]}, True),
+        )
+        for filters, skipped in cases:
+            with self.subTest(filters=filters):
+                workflow = self.workflow(FakeAdb(), filters=filters)
+                self.assertEqual(workflow.filter_skip_reason(embedded) is not None, skipped)
+
+    def test_salary_filter_uses_the_salary_field_unit_and_range_minimum(self):
+        cases = (
+            ("250-300元/天", 250, 25, False),
+            ("250-300元/天", 251, None, True),
+            ("15-25K·14薪", 300, 15, False),
+            ("15-25K·14薪", None, 15.5, True),
+            ("4-6K", 200, None, False),
+            ("面议", None, None, False),
+            ("面议", 200, 15, False),
+            ("薪资面议", 200, None, False),
+            ("薪资： 面议", 200, 15, False),
+            ("薪酬面议", None, 15, False),
+            ("工资面议", 200, 15, False),
+            ("待遇面议", 200, 15, False),
+            ("薪资待定", 200, 15, True),
+            (None, 200, 15, True),
+        )
+        for salary, daily, monthly, skipped in cases:
+            with self.subTest(salary=salary, daily=daily, monthly=monthly):
+                extra = '<node resource-id="tv_scale" text="100-499人" bounds="[150,260][230,290]"/>'
+                if salary is not None:
+                    extra += f'<node resource-id="tv_salary_statue" text="{salary}" bounds="[320,220][490,250]"/>'
+                position = list_cards(listing(card(extra=extra)))[0]
+                workflow = self.workflow(FakeAdb(), filters={
+                    "min_daily_salary": daily, "min_monthly_salary_k": monthly,
+                })
+                self.assertEqual(workflow.filter_skip_reason(position) is not None, skipped)
+
+    def test_negotiable_salary_still_applies_keyword_filters(self):
+        position = list_cards(listing(card(title="C++ 开发工程师", extra=(
+            '<node resource-id="tv_salary_statue" text="面议" bounds="[320,220][490,250]"/>'
+        ))))[0]
+        workflow = self.workflow(FakeAdb(), filters={
+            "min_daily_salary": 200, "min_monthly_salary_k": 15,
+            "exclude_enabled": True, "exclude_keywords": ["C++"],
+        })
+        self.assertIn("岗位名称命中反向关键词", workflow.filter_skip_reason(position))
+
+    def test_negotiable_salary_checkbox_applies_with_or_without_a_numeric_threshold(self):
+        position = list_cards(listing(card(extra=(
+            '<node resource-id="tv_salary_statue" text="面议" bounds="[320,220][490,250]"/>'
+        ))))[0]
+        for minimum in (None, 200):
+            for allowed in (True, False):
+                with self.subTest(minimum=minimum, allowed=allowed):
+                    workflow = self.workflow(FakeAdb(), filters={
+                        "allow_negotiable_salary": allowed, "min_daily_salary": minimum,
+                    })
+                    reason = workflow.filter_skip_reason(position)
+                    if allowed:
+                        self.assertIsNone(reason)
+                    else:
+                        self.assertIn("面议", reason)
 
     def test_quick_phrase_fails_before_adb(self):
         adb = FakeAdb()
@@ -99,6 +192,23 @@ class WorkflowTests(unittest.TestCase):
             self.workflow(adb).run()
         self.assertEqual(adb.taps, [])
         self.assertEqual(adb.scroll_calls, 0)
+
+    def test_exhausted_quota_does_not_click_confirmation(self):
+        adb = FakeAdb(quota_reminder("您今天已与150位BOSS沟通，还剩0次沟通机会哦"))
+        with self.assertRaises(RuntimeError):
+            self.workflow(adb).wait_job_list()
+        self.assertEqual(len(adb.dump_timeouts), 1)
+        self.assertEqual(adb.taps, [])
+        self.assertEqual(adb.back_calls, 0)
+
+    def test_unrelated_or_disabled_popup_is_not_confirmed(self):
+        for popup in (quota_reminder("请先验证身份"), quota_reminder(enabled="false")):
+            with self.subTest(popup=ElementTree.tostring(popup, encoding="unicode")):
+                adb = FakeAdb(popup)
+                with self.assertRaises(RuntimeError):
+                    self.workflow(adb).wait_job_list()
+                self.assertEqual(adb.taps, [])
+                self.assertEqual(adb.back_calls, 0)
 
     def test_greeting_ignores_card_buttons_and_finds_the_enabled_detail_button(self):
         card_button = '<node resource-id="btn_chat" text="立即沟通" bounds="[100,300][400,400]"/>'
@@ -243,7 +353,7 @@ class WorkflowTests(unittest.TestCase):
             '<node resource-id="check_view" bounds="[60,100][100,140]"/>'
             '<node resource-id="check_view" bounds="[160,100][200,140]"/>'
         )
-        for image, tap in (({}, (80, 120)), ({"index": "2"}, (180, 120))):
+        for image, tap in (({}, (80, 120)), ({"indices": []}, (80, 120)), ({"index": "2"}, (180, 120))):
             with self.subTest(image=image):
                 adb = FakeAdb(grid)
                 self.workflow(adb, image=image).select_image()
@@ -425,6 +535,102 @@ class WorkflowTests(unittest.TestCase):
         send_image.assert_not_called()
         self.assertEqual(adb.taps, [(250, 325), (300, 945)])
         self.assertEqual(adb.back_calls, 0)
+
+
+class DeliverySessionTests(unittest.TestCase):
+    def controller_and_phone(self, *pages):
+        directory = self.enterContext(tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent))
+        self.enterContext(patch.object(core, 'DELIVERY_STATS_PATH', Path(directory) / 'stats.sqlite3'))
+        self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+        adb = FakeAdb(*pages)
+        adb.port = 5037
+        adb.serial = 'phone'
+        adb.connect = Mock(return_value=adb.serial)
+        self.enterContext(patch.object(core, 'AdbClient', return_value=adb))
+        self.enterContext(patch('bossapply.engine.workflow.time.monotonic', lambda: adb.now))
+        controller = core.Controller()
+
+        def stop_worker():
+            controller.halt()
+            if controller.thread is not None:
+                controller.thread.join(3)
+
+        self.addCleanup(stop_worker)
+        return controller, adb
+
+    def finished_state(self, controller, result):
+        controller.thread.join(3)
+        state = controller.snapshot()
+        self.assertFalse(state['running'], state['logs'])
+        self.assertEqual(state['result'], result, state['logs'])
+        return state
+
+    def test_switching_apps_preserves_progress_and_original_settings(self):
+        jobs = listing(card() + card(title='另一职位', bounds='[0,450][500,720]'))
+        detail = screen('<node resource-id="btn_chat" text="立即沟通" bounds="[100,900][500,990]"/>')
+        chat = screen('<node resource-id="editText_with_scrollbar" bounds="[0,900][500,990]"/>')
+        another_app = screen('', package='other.app')
+        controller, adb = self.controller_and_phone(
+            jobs, detail, chat, another_app, another_app, jobs, detail, chat, jobs,
+        )
+
+        config = {'run': {'limit': 2}, 'filters': {'min_daily_salary': None, 'min_monthly_salary_k': None}}
+        self.assertTrue(controller.start(config))
+        stopped = self.finished_state(controller, 'error')
+        self.assertTrue(stopped['can_resume'])
+        self.assertEqual((stopped['done'], stopped['today_success']), (1, 1))
+        self.assertEqual(adb.taps, [(250, 325), (300, 945)])
+
+        config['run']['limit'] = 1
+        with patch.object(core, 'read_config', side_effect=AssertionError('resume must reuse task settings')):
+            self.assertTrue(controller.resume())
+            still_away = self.finished_state(controller, 'error')
+            self.assertTrue(still_away['can_resume'])
+            self.assertEqual(adb.taps, [(250, 325), (300, 945)])
+            self.assertTrue(controller.resume())
+            finished = self.finished_state(controller, 'complete')
+        reconnect = core.AdbClient.call_args.args[0]
+        self.assertEqual((reconnect['serial'], reconnect['port']), ('phone', 5037))
+        self.assertFalse(finished['can_resume'])
+        self.assertEqual((finished['done'], finished['limit'], finished['today_success']), (2, 2, 2))
+        self.assertEqual(finished['logs'][:len(stopped['logs'])], stopped['logs'])
+        self.assertEqual(adb.taps, [(250, 325), (300, 945), (250, 585), (300, 945)])
+
+    def test_interrupted_greeting_keeps_its_quota_and_is_not_repeated(self):
+        jobs = listing(card() + card(title='另一职位', bounds='[0,450][500,720]'))
+        detail = screen('<node resource-id="btn_chat" text="立即沟通" bounds="[100,900][500,990]"/>')
+        chat = screen('<node resource-id="editText_with_scrollbar" bounds="[0,900][500,990]"/>')
+        controller, adb = self.controller_and_phone(jobs, detail, InterruptedError(), jobs, detail, chat, jobs)
+
+        self.assertTrue(controller.start({
+            'run': {'limit': 2}, 'filters': {'min_daily_salary': None, 'min_monthly_salary_k': None},
+        }))
+        stopped = self.finished_state(controller, 'stopped')
+        self.assertTrue(stopped['can_resume'])
+        self.assertEqual((stopped['done'], stopped['today_success']), (0, 0))
+        self.assertEqual(adb.taps, [(250, 325), (300, 945)])
+
+        self.assertTrue(controller.resume())
+        finished = self.finished_state(controller, 'complete')
+        self.assertFalse(finished['can_resume'])
+        self.assertEqual((finished['done'], finished['today_success']), (1, 1))
+        self.assertEqual(adb.taps, [(250, 325), (300, 945), (250, 585), (300, 945)])
+
+    def test_boss_quota_reminder_is_confirmed_once_and_deliveries_continue(self):
+        jobs = listing(card() + card(title='另一职位', bounds='[0,450][500,720]'))
+        detail = screen('<node resource-id="btn_chat" text="立即沟通" bounds="[100,900][500,990]"/>')
+        chat = screen('<node resource-id="editText_with_scrollbar" bounds="[0,900][500,990]"/>')
+        popup = quota_reminder()
+        controller, adb = self.controller_and_phone(jobs, detail, popup, popup, chat, jobs, detail, chat, jobs)
+        controller.delivery_stats.prepare()
+        controller.delivery_stats.add_successes(119)
+
+        self.assertTrue(controller.start({
+            'run': {'limit': 2}, 'filters': {'min_daily_salary': None, 'min_monthly_salary_k': None},
+        }))
+        finished = self.finished_state(controller, 'complete')
+        self.assertEqual((finished['done'], finished['today_success']), (2, 121))
+        self.assertEqual(adb.taps, [(250, 325), (300, 945), (250, 570), (250, 585), (300, 945)])
 
 
 if __name__ == "__main__":

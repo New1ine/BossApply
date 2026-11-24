@@ -20,10 +20,13 @@ class ConfigTests(unittest.TestCase):
         self.path = Path(directory) / 'config.json'
         self.enterContext(patch.object(core, 'CONFIG_PATH', self.path))
 
-    def test_missing_config_defaults_to_no_image(self):
+    def test_missing_config_uses_defaults_without_creating_a_file(self):
         cfg = core.read_config()
         self.assertFalse(cfg['actions']['image'])
         self.assertEqual(cfg['image']['indices'], [1])
+        self.assertEqual(cfg['run']['limit'], 100)
+        self.assertEqual(cfg['filters']['min_daily_salary'], 100.0)
+        self.assertEqual(cfg['filters']['min_monthly_salary_k'], 3.0)
         self.assertFalse(self.path.exists())
 
     def test_partial_legacy_config_preserves_values_and_normalizes_filters(self):
@@ -40,8 +43,24 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn('index', cfg['image'])
         self.assertFalse(cfg['filters']['exclude_enabled'])
         self.assertEqual(cfg['filters']['include_keywords'], ['Python'])
+        self.assertEqual(cfg['filters']['require_include_keywords'], [])
+        self.assertEqual(cfg['filters']['min_daily_salary'], 100.0)
+        self.assertEqual(cfg['filters']['min_monthly_salary_k'], 3.0)
+        self.assertTrue(cfg['filters']['allow_negotiable_salary'])
         core.write_config(cfg)
         self.assertEqual(core.read_config(), cfg)
+
+    def test_delivery_target_clamps_whole_numbers_and_saves_the_result(self):
+        cases = (
+            (-10, 1), ('0', 1), ('001', 1), ('37', 37), (150, 150), ('9999', 150),
+            ('０５', 1), (' 37 ', 1), ('+37', 1), ('1_00', 1), ('1.5', 1), (1.5, 1), ('', 1), (True, 1),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(core.normalize_delivery_target(value), expected)
+                core.write_config({'run': {'limit': value}})
+                self.assertEqual(core.read_config()['run']['limit'], expected)
+        self.assertEqual(core.normalize_delivery_target('9' * 5000), 150)
 
     def test_image_indices_keep_tag_order_and_round_trip(self):
         core.write_config({'actions': {'image': True}, 'image': {'indices': ['3', 1, 3], 'index': 2}})
@@ -49,15 +68,48 @@ class ConfigTests(unittest.TestCase):
             'album': 'My Documents', 'indices': [3, 1], 'original': True,
         })
 
+    def test_empty_photo_selection_defaults_to_first_photo(self):
+        self.path.write_text('{"actions":{"image":true},"image":{"indices":[]}}', encoding='utf-8')
+        cfg = core.read_config()
+        self.assertTrue(cfg['actions']['image'])
+        self.assertEqual(cfg['image']['indices'], [1])
+        core.write_config(cfg)
+        self.assertEqual(core.read_config()['image']['indices'], [1])
+
+    def test_saves_separate_keyword_scopes_and_optional_salary_thresholds(self):
+        core.write_config({'filters': {
+            'exclude_enabled': True, 'exclude_keywords': ['C++'],
+            'require_include_enabled': True, 'require_include_keywords': [' STM32 ', 'stm32'],
+            'min_daily_salary': ' ', 'min_monthly_salary_k': ' 15.5 ', 'allow_negotiable_salary': 'false',
+        }})
+        filters = core.read_config()['filters']
+        self.assertTrue(filters['exclude_enabled'])
+        self.assertEqual(filters['exclude_keywords'], ['C++'])
+        self.assertTrue(filters['require_include_enabled'])
+        self.assertEqual(filters['require_include_keywords'], ['STM32'])
+        self.assertIsNone(filters['min_daily_salary'])
+        self.assertEqual(filters['min_monthly_salary_k'], 15.5)
+        self.assertFalse(filters['allow_negotiable_salary'])
+
+    def test_legacy_null_salary_thresholds_remain_disabled(self):
+        self.path.write_text(
+            '{"filters":{"min_daily_salary":null,"min_monthly_salary_k":null}}', encoding='utf-8',
+        )
+        cfg = core.read_config()
+        self.assertIsNone(cfg['filters']['min_daily_salary'])
+        self.assertIsNone(cfg['filters']['min_monthly_salary_k'])
+
     def test_invalid_config_is_rejected_without_modifying_original(self):
         malformed = (
-            b'{', b'[]', b'{"run":null}', b'{"run":{"limit":0}}',
-            b'{"run":{"limit":1.5}}', b'{"device":{"click_interval":NaN}}',
+            b'{', b'[]', b'{"run":null}', b'{"device":{"click_interval":NaN}}',
             b'{"actions":{"image":"yes"}}', b'{"filters":{"exclude_keywords":"Python"}}',
             b'{"filters":{"include_keywords":[null]}}', b'\xff',
             b'{"image":{"index":null}}', b'{"image":{"indices":2}}',
             b'{"image":{"indices":[true]}}', b'{"image":{"indices":[0]}}',
-            b'{"actions":{"image":true},"image":{"indices":[]}}',
+            b'{"image":{"indices":[null]}}',
+            b'{"filters":{"require_exclude_keywords":"C++"}}',
+            b'{"filters":{"min_daily_salary":0}}', b'{"filters":{"min_monthly_salary_k":"NaN"}}',
+            b'{"filters":{"allow_negotiable_salary":"yes"}}',
         )
         for raw in malformed:
             with self.subTest(raw=raw):
@@ -143,13 +195,13 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(controller.snapshot()['running'])
 
     def test_confirmed_deliveries_persist_through_error_and_another_run(self):
-        def first_run(config, *, progress, log):
+        def first_run(config, *, progress, **_callbacks):
             progress(1, '职位 A')
             progress(1, '职位 A')
             progress(2, '职位 B')
             raise RuntimeError('后续职位执行失败')
 
-        def second_run(config, *, progress, log):
+        def second_run(config, *, progress, **_callbacks):
             progress(1, '职位 C')
 
         class Workflow:

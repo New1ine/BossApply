@@ -21,7 +21,7 @@ if sys.stderr is None:
 
 import customtkinter as ctk
 
-from .core import CONTROLLER, normalize_config, read_config, write_config
+from .core import CONTROLLER, normalize_config, normalize_delivery_target, read_config, write_config
 from .engine.adb_client import AdbClient
 
 ctk.set_appearance_mode("light")
@@ -46,16 +46,16 @@ class TagEditor(ctk.CTkFrame):
 
         row = ctk.CTkFrame(self, fg_color="transparent")
         row.pack(fill="x")
-        self.entry = ctk.CTkEntry(row, width=90, height=34, placeholder_text=placeholder,
+        self.entry = ctk.CTkEntry(row, width=90, height=32, placeholder_text=placeholder,
                                   border_color=BORDER, fg_color=WHITE, text_color=TEXT)
         self.entry.pack(side="left", fill="x", expand=True, padx=(0, 7))
         self.entry.bind("<Return>", self.add_entry)
-        ctk.CTkButton(row, text="添加", width=55, height=34, fg_color="#EAF1FF",
+        ctk.CTkButton(row, text="添加", width=50, height=32, fg_color="#EAF1FF",
                       hover_color="#D9E7FF", text_color=ACCENT,
                       command=self.add_entry).pack(side="right")
 
         self.tag_area = tk.Frame(self, bg=WHITE, height=1)
-        self.tag_area.pack(fill="x", pady=(7, 0))
+        self.tag_area.pack(fill="x", pady=(4, 0))
         self.tag_area.bind("<Configure>", self._layout_tags)
 
     def add_entry(self, event=None):
@@ -108,13 +108,11 @@ class TagEditor(ctk.CTkFrame):
 
 
 class KeywordFilter(ctk.CTkFrame):
-    def __init__(self, parent, label, hint):
+    def __init__(self, parent, label):
         super().__init__(parent, fg_color="transparent")
         self.enabled = tk.BooleanVar(master=self)
-        ctk.CTkCheckBox(self, text=label, variable=self.enabled, text_color=TEXT,
-                        fg_color=ACCENT).pack(anchor="w")
-        ctk.CTkLabel(self, text=hint, text_color=MUTED,
-                     font=ctk.CTkFont(size=13)).pack(anchor="w", pady=(2, 4))
+        ctk.CTkCheckBox(self, text=label, variable=self.enabled, text_color=TEXT, height=24,
+                        checkbox_width=19, checkbox_height=19, fg_color=ACCENT).pack(anchor="w", pady=(0, 5))
         self.tags = TagEditor(self, "输入关键词")
         self.tags.pack(fill="x")
 
@@ -145,6 +143,7 @@ class Desktop(ctk.CTk):
         self.advanced_open = False
         self.wifi_open = False
         self._last_log_count = 0
+        self._last_logs = []
         self._last_result = "idle"
         self._last_controls = None
         self._init_ui()
@@ -173,6 +172,22 @@ class Desktop(ctk.CTk):
                              fg_color=WHITE, text_color=TEXT, corner_radius=8,
                              font=ctk.CTkFont(size=14), show=show)
         entry.pack(fill="x")
+        return var
+
+    def _inline_entry(self, parent, label, width, suffix=None, *, commit=None):
+        field = ctk.CTkFrame(parent, fg_color="transparent")
+        field.pack(side="left", anchor="n", padx=(0, 12))
+        if label:
+            ctk.CTkLabel(field, text=label, text_color=MUTED).pack(side="left", padx=(0, 6))
+        var = tk.StringVar(master=field)
+        entry = ctk.CTkEntry(field, textvariable=var, width=width, height=32, corner_radius=8,
+                             border_color=BORDER, fg_color=WHITE, text_color=TEXT)
+        entry.pack(side="left")
+        if commit is not None:
+            entry.bind("<FocusOut>", commit)
+            entry.bind("<Return>", commit)
+        if suffix:
+            ctk.CTkLabel(field, text=suffix, text_color=MUTED).pack(side="left", padx=(6, 0))
         return var
 
     def _init_ui(self):
@@ -257,52 +272,66 @@ class Desktop(ctk.CTk):
 
         settings = self._card(content)
         settings_top = ctk.CTkFrame(settings, fg_color="transparent")
-        settings_top.pack(fill="x", padx=18, pady=(12, 9))
+        settings_top.pack(fill="x", padx=16, pady=(10, 6))
         ctk.CTkLabel(settings_top, text="投递设置", text_color=TEXT,
-                     font=ctk.CTkFont(size=15, weight="bold")).pack(side="left")
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(side="left", padx=(0, 14))
+        self.limit = self._inline_entry(settings_top, "目标份数", width=54, suffix="份", commit=self._commit_target)
         self.today_success = ctk.CTkLabel(settings_top, text="", fg_color="#EAF1FF",
                                           text_color=ACCENT, corner_radius=8, height=32, padx=10,
                                           font=ctk.CTkFont(size=14, weight="bold"))
         self.today_success.pack(side="right")
-        row = ctk.CTkFrame(settings, fg_color="transparent")
-        row.pack(fill="x", padx=(18, 6), pady=(0, 18))
-        self.limit = self._entry(row, "投递上限（1～150）")
 
-        filters = self._card(content)
-        self._header(filters, "关键词筛选")
-        ctk.CTkLabel(filters, text="匹配职位卡片文字。两者都开时，从正向命中的职位中剔除反向命中的职位。",
-                     text_color=MUTED, font=ctk.CTkFont(size=13)).pack(anchor="w", padx=18, pady=(0, 9))
-        row = ctk.CTkFrame(filters, fg_color="transparent")
-        row.pack(fill="x", padx=18, pady=(0, 14))
-        row.grid_columnconfigure((0, 1), weight=1, uniform="filters")
-        self.keyword_filters = {
-            'exclude': KeywordFilter(row, "反向筛选", "命中任一标签就跳过"),
-            'include': KeywordFilter(row, "正向筛选", "仅沟通命中任一标签的职位"),
-        }
-        self.keyword_filters['exclude'].grid(row=0, column=0, sticky="nsew", padx=(0, 9))
-        self.keyword_filters['include'].grid(row=0, column=1, sticky="nsew", padx=(9, 0))
+        salary = ctk.CTkFrame(settings, fg_color="transparent")
+        salary.pack(fill="x", padx=16, pady=(0, 3))
+        self.min_daily_salary = self._inline_entry(salary, "最低薪资", width=63, suffix="元/天")
+        self.min_monthly_salary_k = self._inline_entry(salary, None, width=63, suffix="K")
+        self.allow_negotiable_salary = tk.BooleanVar(master=salary)
+        ctk.CTkCheckBox(salary, text="允许面议", variable=self.allow_negotiable_salary, width=92, height=32,
+                        checkbox_width=19, checkbox_height=19, fg_color=ACCENT,
+                        text_color=TEXT).pack(side="left")
+        ctk.CTkLabel(salary, text="按薪资区间下限比较", text_color=MUTED,
+                     font=ctk.CTkFont(size=13)).pack(side="right")
+
+        filters = ctk.CTkTabview(settings, height=118, anchor="nw", fg_color="transparent",
+                                 segmented_button_fg_color="#F2F5FA",
+                                 segmented_button_unselected_color="#F2F5FA",
+                                 segmented_button_unselected_hover_color="#EBF0F9",
+                                 segmented_button_selected_color="#DAE7FF",
+                                 segmented_button_selected_hover_color="#D0E1FC", text_color=TEXT)
+        filters.pack(fill="x", padx=12, pady=(0, 7))
+        self.keyword_filters = {}
+        for prefix, label in (("", "岗位名称关键词"), ("require_", "岗位要求关键词")):
+            tab = filters.add(label)
+            tab.grid_columnconfigure((0, 1), weight=1, uniform="filters")
+            for column, (kind, text) in enumerate((("exclude", "排除关键词"), ("include", "包含关键词"))):
+                editor = KeywordFilter(tab, text)
+                editor.grid(row=0, column=column, sticky="new", padx=(6, 6), pady=(2, 0))
+                self.keyword_filters[prefix + kind] = editor
 
         send = self._card(content)
-        self._header(send, "发送方式")
-        ctk.CTkLabel(send, text="默认招呼语（点击立即沟通后由 BOSS 自动发送）", text_color=MUTED,
-                     font=ctk.CTkFont(size=14)).pack(anchor="w", padx=18, pady=(0, 8))
+        send_top = ctk.CTkFrame(send, fg_color="transparent")
+        send_top.pack(fill="x", padx=16, pady=(8, 8))
+        ctk.CTkLabel(send_top, text="发送方式", text_color=TEXT,
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(send_top, text="BOSS 默认招呼语", text_color=MUTED,
+                     font=ctk.CTkFont(size=13)).pack(side="left")
         self.image_enabled = tk.BooleanVar(value=False)
-        image_switch = ctk.CTkSwitch(send, text="招呼后发送图片", variable=self.image_enabled,
+        image_switch = ctk.CTkSwitch(send_top, text="招呼后发送图片", variable=self.image_enabled,
                                      onvalue=True, offvalue=False, progress_color=ACCENT,
                                      text_color=TEXT, command=self._image_fields_toggle)
-        image_switch.pack(anchor="w", padx=18, pady=(0, 11))
+        image_switch.pack(side="right")
         self.image_area = ctk.CTkFrame(send, fg_color="transparent")
-        self.image_area.pack(fill="x", padx=(18, 6), pady=(0, 16))
         line = ctk.CTkFrame(self.image_area, fg_color="transparent")
         line.pack(fill="x")
-        self.album = self._entry(line, "手机相册名", width=210)
-        ctk.CTkLabel(self.image_area, text="相册可见照片从左到右、从上到下编号，按标签添加顺序勾选。",
-                     text_color=MUTED, font=ctk.CTkFont(size=13)).pack(anchor="w", pady=(8, 4))
-        self.photo_indices = TagEditor(self.image_area, "输入照片序号，如 2", parse_value=_photo_index)
-        self.photo_indices.pack(fill="x", padx=(0, 12))
+        self.album = self._inline_entry(line, "相册", width=126)
+        ctk.CTkLabel(line, text="照片序号", text_color=MUTED, height=32).pack(side="left", anchor="n", padx=(0, 6))
         self.original = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(self.image_area, text="原图发送", variable=self.original,
-                        text_color=TEXT, width=115, height=24).pack(anchor="w", pady=(11, 0))
+        ctk.CTkCheckBox(line, text="原图发送", variable=self.original, text_color=TEXT, width=88, height=32,
+                        checkbox_width=19, checkbox_height=19).pack(side="right", anchor="n", padx=(10, 0))
+        self.photo_indices = TagEditor(line, "如 2", parse_value=_photo_index)
+        self.photo_indices.pack(side="left", fill="x", expand=True, anchor="n")
+        ctk.CTkLabel(self.image_area, text="照片从左到右、从上到下编号，按标签顺序发送。",
+                     text_color=MUTED, font=ctk.CTkFont(size=12), height=22).pack(anchor="w", pady=(3, 0))
 
         self.advanced_btn = ctk.CTkButton(content, text="高级设置  ▸", height=30, anchor="w",
                                           fg_color="transparent", hover_color="#EBF0F9",
@@ -333,6 +362,10 @@ class Desktop(ctk.CTk):
         self.start_btn = ctk.CTkButton(actions, text="开始投递", height=42, corner_radius=9,
                                        fg_color=ACCENT, hover_color="#1D4ED8", command=self.start)
         self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 9))
+        self.resume_btn = ctk.CTkButton(actions, text="继续投递", height=42, corner_radius=9,
+                                        fg_color="#EAF1FF", hover_color="#D9E7FF", text_color=ACCENT,
+                                        command=self.resume)
+        self.resume_btn.pack(side="left", fill="x", expand=True, padx=(0, 9))
         self.stop_btn = ctk.CTkButton(actions, text="停止", height=42, width=90, corner_radius=9,
                                       fg_color="#F0F2F6", hover_color="#E1E6EF", text_color=TEXT,
                                       command=self.stop)
@@ -361,6 +394,9 @@ class Desktop(ctk.CTk):
         if text != self.today_success.cget('text'):
             self.today_success.configure(text=text)
 
+    def _commit_target(self, event=None):
+        self.limit.set(str(normalize_delivery_target(self.limit.get())))
+
     def _load(self):
         c = self.cfg
         for variable, value in (
@@ -371,6 +407,11 @@ class Desktop(ctk.CTk):
             (self.scroll_attempts, c['run']['max_scroll_attempts']),
         ):
             variable.set(str(value))
+        for key in ('min_daily_salary', 'min_monthly_salary_k'):
+            value = c['filters'][key]
+            if value is not None:
+                getattr(self, key).set(str(int(value)) if value.is_integer() else str(value))
+        self.allow_negotiable_salary.set(c['filters']['allow_negotiable_salary'])
         self.image_enabled.set(bool(c['actions']['image']))
         self.original.set(bool(c['image']['original']))
         for index in c['image']['indices']:
@@ -383,7 +424,7 @@ class Desktop(ctk.CTk):
 
     def _image_fields_toggle(self):
         if self.image_enabled.get():
-            self.image_area.pack(fill="x", padx=(18, 6), pady=(0, 16))
+            self.image_area.pack(fill="x", padx=16, pady=(0, 8))
         else:
             self.image_area.pack_forget()
 
@@ -431,7 +472,8 @@ class Desktop(ctk.CTk):
 
     def _update_controls(self, state):
         busy = self.closing or self.device_operation is not None or state['running']
-        controls = (busy, self.device_operation, state['running'], state['stopping'], self.closing)
+        can_resume = not busy and state['can_resume']
+        controls = (busy, self.device_operation, state['running'], state['stopping'], can_resume)
         if controls == self._last_controls:
             return
         self._last_controls = controls
@@ -439,6 +481,7 @@ class Desktop(ctk.CTk):
         self.scan_btn.configure(state=mode, text="检测中…" if self.device_operation == 'scan' else "检测设备")
         for control in (self.device_menu, self.pair_btn, self.wifi_connect_btn, self.qr_btn, self.start_btn):
             control.configure(state=mode)
+        self.resume_btn.configure(state='normal' if can_resume else 'disabled')
         self.stop_btn.configure(state='normal' if state['running'] and not state['stopping'] else 'disabled')
 
     def _start_device_job(self, kind, cfg, status, job):
@@ -564,6 +607,9 @@ class Desktop(ctk.CTk):
             keyword_filter.tags.commit_entry()
             cfg['filters'][f'{kind}_enabled'] = keyword_filter.enabled.get()
             cfg['filters'][f'{kind}_keywords'] = keyword_filter.tags.values()
+        for key in ('min_daily_salary', 'min_monthly_salary_k'):
+            cfg['filters'][key] = getattr(self, key).get()
+        cfg['filters']['allow_negotiable_salary'] = self.allow_negotiable_salary.get()
         return normalize_config(cfg)
 
     def save(self, quiet=False):
@@ -571,6 +617,9 @@ class Desktop(ctk.CTk):
             cfg = self._make_config()
             write_config(cfg)
             self.cfg = cfg
+            self.limit.set(str(cfg['run']['limit']))
+            if cfg['actions']['image'] and not self.photo_indices.values():
+                self.photo_indices.add_tag(cfg['image']['indices'][0])
             if not quiet:
                 self._set_status("设置已保存", ACCENT)
             return True
@@ -620,10 +669,24 @@ class Desktop(ctk.CTk):
         if started:
             self._set_status("正在运行", ACCENT)
             self._last_log_count = 0
+            self._last_logs = []
             self._last_result = 'running'
             self.logs.configure(state='normal')
             self.logs.delete('1.0', 'end')
             self.logs.configure(state='disabled')
+            self._update_controls(CONTROLLER.snapshot())
+
+    def resume(self):
+        if self.closing or self.device_operation is not None:
+            return
+        try:
+            resumed = CONTROLLER.resume()
+        except (ValueError, RuntimeError) as err:
+            messagebox.showerror("无法继续投递", str(err), parent=self)
+            return
+        if resumed:
+            self._set_status("正在继续本次任务", ACCENT)
+            self._last_result = 'running'
             self._update_controls(CONTROLLER.snapshot())
 
     def stop(self):
@@ -687,6 +750,34 @@ class Desktop(ctk.CTk):
         self._show_devices(source, devices, name)
         self._set_status(f"WiFi 已连接 · {serial}", "#188264")
 
+    def _update_logs(self, state):
+        log_count = state['log_count']
+        if log_count == self._last_log_count:
+            return
+        logs = state['logs']
+        added = min(log_count - self._last_log_count, len(logs)) if log_count >= self._last_log_count else len(logs)
+        retained = len(logs) - added
+        expired = self._last_logs[:len(self._last_logs) - retained]
+        following = self.logs.yview()[1] == 1.0
+
+        self.logs.configure(state='normal')
+        if expired:
+            if not following:
+                self.logs.mark_set('log_view', '@0,0')
+                self.logs.mark_gravity('log_view', 'left')
+            lines = sum(message.count('\n') + 1 for message in expired)
+            self.logs.delete('1.0', f'{lines + 1}.0')
+        if added:
+            self.logs.insert('end', '\n'.join(logs[retained:]) + '\n')
+        if following:
+            self.logs.see('end')
+        elif expired:
+            self.logs.yview('log_view')
+            self.logs.mark_unset('log_view')
+        self.logs.configure(state='disabled')
+        self._last_log_count = log_count
+        self._last_logs = logs
+
     def _poll(self):
         try:
             event = self.events.get_nowait()
@@ -703,20 +794,19 @@ class Desktop(ctk.CTk):
         n, limit = state['done'], state['limit']
         self.progress_count.configure(text=f"本次任务 {n} / {limit}")
         self.bar.set(n / limit if limit else 0)
-        if state['running']:
-            self.progress_label.configure(text="正在停止…" if state['stopping'] else "正在投递…")
+        if state['stopping']:
+            self.progress_label.configure(text="正在停止…")
+        elif state['running']:
+            self.progress_label.configure(text="正在投递…")
         else:
-            self.progress_label.configure(text={'complete':'任务完成','stopped':'已停止','error':'执行中断'}.get(state['result'],'就绪'))
+            status = {'complete': '任务完成', 'stopped': '已停止', 'error': '执行中断'}.get(state['result'], '就绪')
+            if state['can_resume']:
+                status += "，可继续投递"
+            self.progress_label.configure(text=status)
             if self._last_result == 'running' and state['result'] in ('complete','stopped','error'):
-                self._set_status(self.progress_label.cget('text'))
+                self._set_status(status)
         self._last_result = state['result']
-        if state['log_count'] != self._last_log_count:
-            self.logs.configure(state='normal')
-            self.logs.delete('1.0', 'end')
-            self.logs.insert('end', '\n'.join(state['logs']) + '\n')
-            self.logs.see('end')
-            self.logs.configure(state='disabled')
-            self._last_log_count = state['log_count']
+        self._update_logs(state)
         self.after(350, self._poll)
 
     def _close(self):

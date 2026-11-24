@@ -7,12 +7,13 @@ import sys
 import tempfile
 import threading
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import PROJECT_ROOT
 from .delivery_stats import DailyDeliveryStats, DeliveryStatsError
 from .engine.adb_client import AdbClient
-from .engine.workflow import Workflow
+from .engine.workflow import DeliveryCheckpoint, Workflow
 
 BASE_DIR = (
     Path(os.environ.get("APPDATA") or Path.home()) / "BossApply"
@@ -23,11 +24,17 @@ CONFIG_PATH = BASE_DIR / "config.json"
 DELIVERY_STATS_PATH = BASE_DIR / "delivery_stats.sqlite3"
 DEFAULTS = {
     'device': {'path': 'auto', 'port': 0, 'serial': 'auto', 'click_interval': 0.15},
-    'run': {'limit': 20, 'timeout': 18, 'scroll_fraction': 0.145, 'max_scroll_attempts': 20},
+    'run': {'limit': 100, 'timeout': 18, 'scroll_fraction': 0.145, 'max_scroll_attempts': 20},
     'actions': {'image': False, 'quick_phrase': False},
     'image': {'album': 'My Documents', 'indices': [1], 'original': True},
-    'filters': {'exclude_enabled': False, 'exclude_keywords': [],
-                'include_enabled': False, 'include_keywords': []},
+    'filters': {
+        'exclude_enabled': False, 'exclude_keywords': [],
+        'include_enabled': False, 'include_keywords': [],
+        'require_exclude_enabled': False, 'require_exclude_keywords': [],
+        'require_include_enabled': False, 'require_include_keywords': [],
+        'min_daily_salary': 100.0, 'min_monthly_salary_k': 3.0,
+        'allow_negotiable_salary': True,
+    },
 }
 LOG_LIMIT = 120
 
@@ -42,6 +49,17 @@ def _number(value, convert, field, valid):
     if (convert is float and not math.isfinite(number)) or not valid(number):
         raise ValueError(f'{field}超出允许范围')
     return number
+
+
+def normalize_delivery_target(value):
+    if isinstance(value, str):
+        if not (value.isascii() and value.isdecimal()):
+            return 1
+        digits = value.lstrip('0')
+        value = 150 if len(digits) > 3 else int(digits or '0')
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 1
+    return max(1, min(150, value))
 
 
 def _boolean(value, field):
@@ -79,10 +97,10 @@ def normalize_config(data):
     device = cfg['device']
     run = cfg['run']
     image = cfg['image']
+    run['limit'] = normalize_delivery_target(run['limit'])
     numeric_fields = (
         (device, 'port', int, 'ADB 端口（0～65535）', lambda n: 0 <= n <= 65535),
         (device, 'click_interval', float, '操作后停顿（0～5 秒）', lambda n: 0 <= n <= 5),
-        (run, 'limit', int, '投递上限（1～150）', lambda n: 1 <= n <= 150),
         (run, 'timeout', int, '页面等待上限（3～120 秒）', lambda n: 3 <= n <= 120),
         (run, 'scroll_fraction', float, '短滑屏幕比例（大于 0 且小于 1）', lambda n: 0 < n < 1),
         (run, 'max_scroll_attempts', int, '最大短滑次数（1～100）', lambda n: 1 <= n <= 100),
@@ -109,14 +127,17 @@ def normalize_config(data):
     indices = image['indices']
     if not isinstance(indices, list):
         raise ValueError('图片序号必须是列表')
-    if cfg['actions']['image'] and not indices:
-        raise ValueError('开启发送图片后，请至少添加一个图片序号')
     image['indices'] = list(dict.fromkeys(
-        _number(index, int, '图片序号（至少为 1）', lambda n: n >= 1) for index in indices
+        _number(index, int, '图片序号（至少为 1）', lambda n: n >= 1)
+        for index in (indices or DEFAULTS['image']['indices'])
     ))
 
     filters = cfg['filters']
-    for kind, field in (('exclude', '反向筛选'), ('include', '正向筛选')):
+    filters['allow_negotiable_salary'] = _boolean(filters['allow_negotiable_salary'], '允许面议')
+    for kind, field in (
+        ('exclude', '岗位名称反向筛选'), ('include', '岗位名称正向筛选'),
+        ('require_exclude', '岗位要求反向筛选'), ('require_include', '岗位要求正向筛选'),
+    ):
         enabled_key, keywords_key = f'{kind}_enabled', f'{kind}_keywords'
         filters[enabled_key] = _boolean(filters[enabled_key], field)
         keywords = filters[keywords_key]
@@ -128,6 +149,12 @@ def normalize_config(data):
             if keyword:
                 unique.setdefault(keyword.casefold(), keyword)
         filters[keywords_key] = list(unique.values())
+    for key, field in (('min_daily_salary', '最低日薪'), ('min_monthly_salary_k', '最低月薪')):
+        value = filters[key]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            filters[key] = None
+        else:
+            filters[key] = _number(value, float, field, lambda n: n > 0)
     return cfg
 
 
@@ -157,17 +184,26 @@ def write_config(cfg):
             temp_path.unlink(missing_ok=True)
 
 
+@dataclass
+class _DeliveryTask:
+    config: dict
+    checkpoint: DeliveryCheckpoint = field(default_factory=DeliveryCheckpoint)
+    device: tuple[str, int] | None = None
+
+
 class Controller:
     def __init__(self):
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread = None
+        self.task = None
         self.state = self._new_state()
         self.delivery_stats = DailyDeliveryStats(DELIVERY_STATS_PATH)
 
     @staticmethod
     def _new_state(limit=0):
         return dict(running=bool(limit), stopping=False, done=0, limit=limit,
+                    can_resume=False,
                     logs=deque(maxlen=LOG_LIMIT), log_count=0, device='',
                     result='running' if limit else 'idle')
 
@@ -201,16 +237,24 @@ class Controller:
         except DeliveryStatsError as exc:
             raise DeliveryStatsError(f'本次已确认成功 {n} 份，最近 {count} 份未能写入今日累计。{exc}') from exc
 
-    def _run(self, cfg):
+    def _run(self, task, resuming):
         result = 'complete'
         try:
             self.delivery_stats.prepare()
-            adb = AdbClient(cfg['device'], stopped=self.stop_event)
+            cfg = task.config
+            device_cfg = cfg['device'].copy()
+            if task.device is not None:
+                device_cfg['serial'], device_cfg['port'] = task.device
+            adb = AdbClient(device_cfg, stopped=self.stop_event)
             serial = adb.connect()
+            task.device = (serial, adb.port)
             with self.lock:
                 self.state['device'] = f'{serial} · {adb.port}'
+            if resuming:
+                self.log('正在继续本次投递任务')
             self.log('手机已连接：' + serial + ' · 端口 ' + str(adb.port))
-            Workflow(adb, cfg, log=self.log, progress=self.progress).run()
+            Workflow(adb, cfg, log=self.log, progress=self.progress,
+                     checkpoint=task.checkpoint, resuming=resuming).run()
         except InterruptedError:
             self.log('已停止')
             result = 'stopped'
@@ -222,6 +266,25 @@ class Controller:
                 self.state['running'] = False
                 self.state['stopping'] = False
                 self.state['result'] = result
+                used = self.state['done'] + task.checkpoint.unconfirmed
+                self.state['can_resume'] = result != 'complete' and used < self.state['limit']
+
+    def _start_worker(self, task, resuming):
+        previous = self.state
+        self.stop_event.clear()
+        if resuming:
+            self.state = dict(previous, running=True, stopping=False, result='running', can_resume=False)
+        else:
+            self.state = self._new_state(task.config['run']['limit'])
+        thread = threading.Thread(target=self._run, args=(task, resuming), daemon=True)
+        try:
+            thread.start()
+        except RuntimeError:
+            self.state = previous
+            raise
+        self.thread = thread
+        self.task = task
+        return True
 
     def start(self, cfg=None):
         cfg = read_config() if cfg is None else normalize_config(cfg)
@@ -229,17 +292,13 @@ class Controller:
         with self.lock:
             if self.state['running']:
                 return False
-            previous = self.state
-            self.stop_event.clear()
-            self.state = self._new_state(cfg['run']['limit'])
-            self.thread = threading.Thread(target=self._run, args=(cfg,), daemon=True)
-            try:
-                self.thread.start()
-            except RuntimeError:
-                self.state = previous
-                self.thread = None
-                raise
-        return True
+            return self._start_worker(_DeliveryTask(cfg), resuming=False)
+
+    def resume(self):
+        with self.lock:
+            if not self.state['can_resume']:
+                return False
+            return self._start_worker(self.task, resuming=True)
 
     def halt(self):
         with self.lock:

@@ -2,6 +2,9 @@
 import re
 import time
 import unicodedata
+from dataclasses import dataclass, field
+from decimal import Decimal
+
 from .adb_client import AdbTimeoutError, TransientUiDumpError
 from .uixml import query, queries, rect, middle, list_cards
 
@@ -22,13 +25,37 @@ PREVIEW_CONFIRM_LABEL = re.compile(
     r"(?:确定|确认|发送|确认发送|确定发送)"
     r"(?:\s*\(\s*(?P<count>[1-9][0-9]*)(?:\s*/\s*[0-9]+|\s*张)?\s*\))?"
 )
+CONTACT_QUOTA_REMINDER = re.compile(
+    r"您今天已与[0-9]{1,3}位BOSS沟通[，,]还剩(?P<remaining>[0-9]{1,3})次沟通机会哦"
+)
+KEYWORD_SCOPES = (("", "岗位名称"), ("require_", "岗位要求"))
+NEGOTIABLE_SALARY = re.compile(r"(?:(?:薪资|薪酬|工资|待遇)\s*:?\s*)?面议")
+SALARY_FORMAT = re.compile(
+    r"(?P<low>[0-9]+(?:\.[0-9]+)?)(?:\s*[-~−–—至]\s*(?P<high>[0-9]+(?:\.[0-9]+)?))?"
+    r"\s*(?:(?P<daily>元\s*/\s*天)|K(?:\s*·\s*[0-9]+\s*薪)?)",
+    re.IGNORECASE,
+)
 
 
 class UiTimeoutError(RuntimeError):
     """等待目标页面或控件超时。"""
 
 
+@dataclass
+class DeliveryCheckpoint:
+    processed: set[tuple[str, str]] = field(default_factory=set)
+    anchor: tuple[str, str] | None = None
+    success: int = 0
+    skipped: int = 0
+    unconfirmed: int = 0
+
+    @property
+    def used(self):
+        return self.success + self.unconfirmed
+
+
 def matching_keyword(keywords, texts):
+    texts = tuple(text.casefold() for text in texts)
     for keyword in keywords:
         keyword = keyword.strip()
         folded = keyword.casefold()
@@ -46,11 +73,11 @@ def _image_indices(config):
             indices = [int(image.get("index", 1))]
         except (TypeError, ValueError, OverflowError):
             raise ValueError("图片序号必须是大于 0 的整数") from None
-    if not isinstance(indices, list) or not indices:
-        raise ValueError("请至少添加一个图片序号")
+    if not isinstance(indices, list):
+        raise ValueError("图片序号必须是列表")
     if any(type(index) is not int or index < 1 for index in indices):
         raise ValueError("图片序号必须是大于 0 的整数")
-    return list(dict.fromkeys(indices))
+    return list(dict.fromkeys(indices or [1]))
 
 
 def _confirmation_label_matches(button):
@@ -62,14 +89,16 @@ def _confirmation_label_matches(button):
 
 
 class Workflow:
-    def __init__(self, client, config, log=lambda s: None, progress=lambda n, s: None):
+    def __init__(self, client, config, log=lambda s: None, progress=lambda n, s: None, *,
+                 checkpoint=None, resuming=False):
         self.adb = client
         self.cfg = config
         self.log = log
         self.progress = progress
-        self.done = set()
-        self.anchor = None
+        self.checkpoint = DeliveryCheckpoint() if checkpoint is None else checkpoint
+        self.resuming = resuming
         self.timeout = float(self.cfg["run"].get("timeout", 18))
+        self._quota_reminder_tapped = False
 
     @staticmethod
     def validate_config(config):
@@ -78,10 +107,44 @@ class Workflow:
         if config["actions"].get("image"):
             _image_indices(config)
         filters = config.get("filters", {})
-        if filters.get("include_enabled") and not any(
-            keyword.strip() for keyword in filters.get("include_keywords", [])
-        ):
-            raise ValueError("开启正向筛选后，请至少添加一个关键词")
+        for prefix, label in KEYWORD_SCOPES:
+            if filters.get(f"{prefix}include_enabled") and not any(
+                keyword.strip() for keyword in filters.get(f"{prefix}include_keywords", [])
+            ):
+                raise ValueError(f"开启{label}正向筛选后，请至少添加一个关键词")
+
+    def _dismiss_contact_quota_reminder(self, root):
+        title = query(root, id="tv_title", text="温馨提示")
+        description = query(root, id="tv_desc_out")
+        if title is None or description is None:
+            self._quota_reminder_tapped = False
+            return False
+
+        message = description.get("text", "")
+        reminder = CONTACT_QUOTA_REMINDER.fullmatch(message.strip())
+        container = query(root, id="btn_container_view")
+        if reminder is None:
+            if container is not None:
+                raise RuntimeError("遇到未识别的 BOSS 直聘提示，请在手机上确认后继续投递")
+            self._quota_reminder_tapped = False
+            return False
+        if int(reminder["remaining"]) == 0:
+            raise RuntimeError("BOSS 直聘提示今日沟通次数已用尽")
+        if self._quota_reminder_tapped:
+            return True
+
+        groups = queries(container, "ll_buttons") if container is not None else []
+        if len(groups) != 1:
+            raise RuntimeError("未确认 BOSS 直聘沟通提示的按钮区域，请在手机上处理")
+        buttons = [node for node in groups[0].iter("node")
+                   if node.get("text") == "好" and node.get("clickable") == "true"
+                   and node.get("enabled") == "true" and rect(node) is not None]
+        if len(buttons) != 1:
+            raise RuntimeError("未确认 BOSS 直聘沟通提示的可点击按钮，请在手机上处理")
+        self.adb.tap(*middle(buttons[0]))
+        self._quota_reminder_tapped = True
+        self.log(f"已确认 BOSS 直聘沟通提示：{message}")
+        return True
 
     def ui_samples(self, deadline, interval):
         retries = 0
@@ -107,7 +170,8 @@ class Workflow:
                 if windows:
                     if len(windows) != 1 or windows[0].get("package") != BOSS_PACKAGE:
                         raise RuntimeError("手机前台不是 BOSS 直聘独立页面，请返回已筛选的职位列表后重试")
-                    yield windows[0]
+                    if not self._dismiss_contact_quota_reminder(windows[0]):
+                        yield windows[0]
 
             remaining = deadline - time.monotonic()
             if remaining > 0:
@@ -147,10 +211,10 @@ class Workflow:
             return None
         return cards
 
-    def wait_job_list(self):
+    def wait_job_list(self, *, require_cards=False):
         for root in self.ui_samples(time.monotonic() + self.timeout, 0.15):
             cards = self.job_list_cards(root)
-            if cards is not None:
+            if cards is not None and (cards or not require_cards):
                 return cards
         raise UiTimeoutError("未确认职位列表，请在手机上打开已筛选的职位列表")
 
@@ -160,9 +224,9 @@ class Workflow:
         for scrolled in range(max_scrolls + 1):
             if cards is None:
                 cards = self.wait_job_list()
-            idx = next((i for i, c in enumerate(cards) if c["key"] == self.anchor), None)
+            idx = next((i for i, c in enumerate(cards) if c["key"] == self.checkpoint.anchor), None)
             candidates = cards[idx + 1:] if idx is not None else cards
-            target = next((c for c in candidates if c["complete"] and c["key"] not in self.done), None)
+            target = next((c for c in candidates if c["complete"] and c["key"] not in self.checkpoint.processed), None)
             if target is not None:
                 return target
             if scrolled == max_scrolls:
@@ -378,19 +442,45 @@ class Workflow:
 
     def keyword_skip_reason(self, card):
         filters = self.cfg.get("filters", {})
-        exclude_enabled = filters.get("exclude_enabled", False)
-        include_enabled = filters.get("include_enabled", False)
-        if not (exclude_enabled or include_enabled):
+        values = ((card["title"],), card.get("requirements", ()))
+        missing_include = None
+        for (prefix, label), texts in zip(KEYWORD_SCOPES, values):
+            if filters.get(f"{prefix}exclude_enabled"):
+                matched = matching_keyword(filters.get(f"{prefix}exclude_keywords", []), texts)
+                if matched is not None:
+                    return f"{label}命中反向关键词「{matched}」"
+            if filters.get(f"{prefix}include_enabled") and matching_keyword(
+                filters.get(f"{prefix}include_keywords", []), texts
+            ) is None:
+                missing_include = missing_include or f"{label}未命中正向关键词"
+        return missing_include
+
+    def salary_skip_reason(self, card):
+        filters = self.cfg.get("filters", {})
+        salary = unicodedata.normalize("NFKC", card.get("salary") or "").strip()
+        if NEGOTIABLE_SALARY.fullmatch(salary):
+            return None if filters.get("allow_negotiable_salary", True) else "薪资面议，未勾选允许面议"
+
+        daily = filters.get("min_daily_salary")
+        monthly = filters.get("min_monthly_salary_k")
+        if daily is None and monthly is None:
             return None
 
-        texts = [text.casefold() for text in card["texts"]]
-        if exclude_enabled:
-            keyword = matching_keyword(filters.get("exclude_keywords", []), texts)
-            if keyword is not None:
-                return f"命中反向关键词「{keyword}」"
-        if include_enabled and matching_keyword(filters.get("include_keywords", []), texts) is None:
-            return "未命中正向关键词"
+        match = SALARY_FORMAT.fullmatch(salary)
+        if match is None:
+            return "薪资未知，无法判断是否符合最低薪资"
+        low = Decimal(match["low"])
+        high = Decimal(match["high"]) if match["high"] is not None else low
+        if low <= 0 or high < low:
+            return "薪资未知，无法判断是否符合最低薪资"
+
+        minimum, unit = (daily, "元/天") if match["daily"] else (monthly, "K")
+        if minimum is not None and low < Decimal(str(minimum)):
+            return f"薪资下限 {low:g}{unit} 低于设定的 {minimum:g}{unit}"
         return None
+
+    def filter_skip_reason(self, card):
+        return self.keyword_skip_reason(card) or self.salary_skip_reason(card)
 
     def apply_one(self, card):
         self.open_job(card)
@@ -402,28 +492,41 @@ class Workflow:
 
         # 点击立即沟通会触发平台自动发送招呼语。
         self.log("正在点击立即沟通：" + card["title"])
+        point = middle(button)
+        self.adb.check_stop()
         try:
-            self.adb.tap(*middle(button))
+            self.adb.tap(*point)
             self.wait_node("聊天输入框", id=CHAT_INPUT)
         except (UiTimeoutError, AdbTimeoutError) as exc:
             self.log(f"确认招呼时超时：{exc}，当前职位的招呼结果待确认")
             return None
         except (RuntimeError, InterruptedError):
+            self.record_card(card, None)
             self.log("当前职位的招呼结果待确认，请在手机上核对")
             raise
 
         return True
 
+    def record_card(self, card, result):
+        checkpoint = self.checkpoint
+        checkpoint.anchor = card["key"]
+        checkpoint.processed.add(checkpoint.anchor)
+        if result is True:
+            checkpoint.success += 1
+        elif result is False:
+            checkpoint.skipped += 1
+            self.log(f"已跳过 {checkpoint.skipped} 个职位，不占用投递名额")
+        else:
+            checkpoint.unconfirmed += 1
+            self.log(f"招呼结果待确认 {checkpoint.unconfirmed} 个，已计入投递上限")
+
     def run(self):
         self.validate_config(self.cfg)
         limit = int(self.cfg["run"].get("limit", 2))
+        checkpoint = self.checkpoint
+        recovered_cards = self.wait_job_list(require_cards=True) if self.resuming else None
 
-        success = 0
-        skipped = 0
-        unconfirmed = 0
-        recovered_cards = None
-
-        while success + unconfirmed < limit:
+        while checkpoint.used < limit:
             self.adb.check_stop()
 
             card = self.next_card(recovered_cards)
@@ -433,23 +536,21 @@ class Workflow:
                 break
             self.log(
                 f"正在检查：{card['title']} | "
-                f"已用名额 {success + unconfirmed}/{limit}"
+                f"已用名额 {checkpoint.used}/{limit}"
             )
 
-            reason = self.keyword_skip_reason(card)
+            reason = self.filter_skip_reason(card)
             if reason is None:
                 result = self.apply_one(card)
             else:
                 self.log(f"已跳过：{card['title']}（{reason}）")
                 result = False
 
-            self.anchor = card["key"]
-            self.done.add(self.anchor)
+            self.record_card(card, result)
             from_chat = False
             if result is True:
-                success += 1
-                self.progress(success, card["title"])
-                self.log(f"招呼已确认，成功投递：{success}/{limit}")
+                self.progress(checkpoint.success, card["title"])
+                self.log(f"招呼已确认，成功投递：{checkpoint.success}/{limit}")
                 from_chat = True
                 if self.cfg["actions"].get("image", False):
                     try:
@@ -462,19 +563,12 @@ class Workflow:
                             self.log("图片发送流程完成，已回到聊天页")
                         else:
                             self.log("顶部确认后已回到聊天页，图片送达待核对")
-            elif result is False:
-                skipped += 1
-                self.log(f"已跳过 {skipped} 个职位，不占用投递名额")
-            else:
-                unconfirmed += 1
-                self.log(f"招呼结果待确认 {unconfirmed} 个，已计入投递上限")
-
             if reason is None:
                 recovered_cards = self.recover_to_list(card, from_chat=from_chat)
 
         self.log(
-            f"本轮完成：成功投递 {success} 个，"
-            f"跳过 {skipped} 个，"
-            f"结果未确认 {unconfirmed} 个，"
-            f"共检查 {success + skipped + unconfirmed} 个职位"
+            f"本轮完成：成功投递 {checkpoint.success} 个，"
+            f"跳过 {checkpoint.skipped} 个，"
+            f"结果未确认 {checkpoint.unconfirmed} 个，"
+            f"共检查 {checkpoint.used + checkpoint.skipped} 个职位"
         )

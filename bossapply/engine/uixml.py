@@ -76,13 +76,23 @@ def list_cards(root, min_fraction=0.18):
         if key in cards and (cards[key]["complete"] or not complete):
             continue
         texts = [title]
+        salary = ""
+        requirements = []
         for child in parent.iter("node"):
+            child_id = node_id(child)
+            if child_id == "tv_salary_statue" and not salary:
+                salary = (child.get("text") or child.get("content-desc", "")).strip()
+            if child_id == "fl_require_info":
+                requirements.extend(
+                    label for tag in child.iterfind(".//node")
+                    if (label := (tag.get("text") or tag.get("content-desc", "")).strip())
+                )
             if child is not node and (text := child.get("text")):
                 texts.append(text)
             if description := child.get("content-desc"):
                 texts.append(description)
         cards[key] = {
             "key": key, "title": title, "company": company, "bounds": bounds, "texts": texts,
-            "complete": complete,
+            "complete": complete, "salary": salary, "requirements": requirements,
         }
     return sorted(cards.values(), key=lambda c: c["bounds"][1])
