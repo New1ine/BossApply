@@ -281,15 +281,21 @@ class Desktop(ctk.CTk):
                                           font=ctk.CTkFont(size=14, weight="bold"))
         self.today_success.pack(side="right")
 
-        salary = ctk.CTkFrame(settings, fg_color="transparent")
-        salary.pack(fill="x", padx=16, pady=(0, 3))
-        self.min_daily_salary = self._inline_entry(salary, "最低薪资", width=63, suffix="元/天")
-        self.min_monthly_salary_k = self._inline_entry(salary, None, width=63, suffix="K")
-        self.allow_negotiable_salary = tk.BooleanVar(master=salary)
-        ctk.CTkCheckBox(salary, text="允许面议", variable=self.allow_negotiable_salary, width=92, height=32,
+        min_salary = ctk.CTkFrame(settings, fg_color="transparent")
+        min_salary.pack(fill="x", padx=16, pady=(0, 3))
+        max_salary = ctk.CTkFrame(settings, fg_color="transparent")
+        max_salary.pack(fill="x", padx=16, pady=(0, 3))
+        self.salary_fields = {
+            'min_daily_salary': self._inline_entry(min_salary, "最低薪资", width=63, suffix="元/天"),
+            'min_monthly_salary_k': self._inline_entry(min_salary, None, width=63, suffix="K"),
+            'max_daily_salary': self._inline_entry(max_salary, "最高薪资", width=63, suffix="元/天"),
+            'max_monthly_salary_k': self._inline_entry(max_salary, None, width=63, suffix="K"),
+        }
+        self.allow_negotiable_salary = tk.BooleanVar(master=min_salary)
+        ctk.CTkCheckBox(min_salary, text="允许面议", variable=self.allow_negotiable_salary, width=92, height=32,
                         checkbox_width=19, checkbox_height=19, fg_color=ACCENT,
                         text_color=TEXT).pack(side="left")
-        ctk.CTkLabel(salary, text="按薪资区间下限比较", text_color=MUTED,
+        ctk.CTkLabel(min_salary, text="按薪资区间上下限比较", text_color=MUTED,
                      font=ctk.CTkFont(size=13)).pack(side="right")
 
         filters = ctk.CTkTabview(settings, height=118, anchor="nw", fg_color="transparent",
@@ -407,10 +413,10 @@ class Desktop(ctk.CTk):
             (self.scroll_attempts, c['run']['max_scroll_attempts']),
         ):
             variable.set(str(value))
-        for key in ('min_daily_salary', 'min_monthly_salary_k'):
+        for key, variable in self.salary_fields.items():
             value = c['filters'][key]
             if value is not None:
-                getattr(self, key).set(str(int(value)) if value.is_integer() else str(value))
+                variable.set(str(int(value)) if value.is_integer() else str(value))
         self.allow_negotiable_salary.set(c['filters']['allow_negotiable_salary'])
         self.image_enabled.set(bool(c['actions']['image']))
         self.original.set(bool(c['image']['original']))
@@ -607,8 +613,8 @@ class Desktop(ctk.CTk):
             keyword_filter.tags.commit_entry()
             cfg['filters'][f'{kind}_enabled'] = keyword_filter.enabled.get()
             cfg['filters'][f'{kind}_keywords'] = keyword_filter.tags.values()
-        for key in ('min_daily_salary', 'min_monthly_salary_k'):
-            cfg['filters'][key] = getattr(self, key).get()
+        for key, variable in self.salary_fields.items():
+            cfg['filters'][key] = variable.get()
         cfg['filters']['allow_negotiable_salary'] = self.allow_negotiable_salary.get()
         return normalize_config(cfg)
 

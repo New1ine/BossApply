@@ -27,6 +27,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg['run']['limit'], 100)
         self.assertEqual(cfg['filters']['min_daily_salary'], 100.0)
         self.assertEqual(cfg['filters']['min_monthly_salary_k'], 3.0)
+        self.assertIsNone(cfg['filters']['max_daily_salary'])
+        self.assertIsNone(cfg['filters']['max_monthly_salary_k'])
         self.assertFalse(self.path.exists())
 
     def test_partial_legacy_config_preserves_values_and_normalizes_filters(self):
@@ -46,6 +48,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg['filters']['require_include_keywords'], [])
         self.assertEqual(cfg['filters']['min_daily_salary'], 100.0)
         self.assertEqual(cfg['filters']['min_monthly_salary_k'], 3.0)
+        self.assertIsNone(cfg['filters']['max_daily_salary'])
+        self.assertIsNone(cfg['filters']['max_monthly_salary_k'])
         self.assertTrue(cfg['filters']['allow_negotiable_salary'])
         core.write_config(cfg)
         self.assertEqual(core.read_config(), cfg)
@@ -80,7 +84,8 @@ class ConfigTests(unittest.TestCase):
         core.write_config({'filters': {
             'exclude_enabled': True, 'exclude_keywords': ['C++'],
             'require_include_enabled': True, 'require_include_keywords': [' STM32 ', 'stm32'],
-            'min_daily_salary': ' ', 'min_monthly_salary_k': ' 15.5 ', 'allow_negotiable_salary': 'false',
+            'min_daily_salary': ' ', 'min_monthly_salary_k': ' 15.5 ',
+            'max_daily_salary': ' 300 ', 'max_monthly_salary_k': ' 15.5 ', 'allow_negotiable_salary': 'false',
         }})
         filters = core.read_config()['filters']
         self.assertTrue(filters['exclude_enabled'])
@@ -89,7 +94,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(filters['require_include_keywords'], ['STM32'])
         self.assertIsNone(filters['min_daily_salary'])
         self.assertEqual(filters['min_monthly_salary_k'], 15.5)
+        self.assertEqual(filters['max_daily_salary'], 300.0)
+        self.assertEqual(filters['max_monthly_salary_k'], 15.5)
         self.assertFalse(filters['allow_negotiable_salary'])
+
+        filters['max_daily_salary'] = ''
+        filters['max_monthly_salary_k'] = ' '
+        core.write_config({'filters': filters})
+        filters = core.read_config()['filters']
+        self.assertIsNone(filters['max_daily_salary'])
+        self.assertIsNone(filters['max_monthly_salary_k'])
 
     def test_legacy_null_salary_thresholds_remain_disabled(self):
         self.path.write_text(
@@ -109,6 +123,9 @@ class ConfigTests(unittest.TestCase):
             b'{"image":{"indices":[null]}}',
             b'{"filters":{"require_exclude_keywords":"C++"}}',
             b'{"filters":{"min_daily_salary":0}}', b'{"filters":{"min_monthly_salary_k":"NaN"}}',
+            b'{"filters":{"max_daily_salary":0}}', b'{"filters":{"max_monthly_salary_k":"NaN"}}',
+            b'{"filters":{"min_daily_salary":200,"max_daily_salary":199}}',
+            b'{"filters":{"min_monthly_salary_k":20,"max_monthly_salary_k":19}}',
             b'{"filters":{"allow_negotiable_salary":"yes"}}',
         )
         for raw in malformed:

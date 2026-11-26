@@ -461,22 +461,25 @@ class Workflow:
         if NEGOTIABLE_SALARY.fullmatch(salary):
             return None if filters.get("allow_negotiable_salary", True) else "薪资面议，未勾选允许面议"
 
-        daily = filters.get("min_daily_salary")
-        monthly = filters.get("min_monthly_salary_k")
-        if daily is None and monthly is None:
+        daily = (filters.get("min_daily_salary"), filters.get("max_daily_salary"))
+        monthly = (filters.get("min_monthly_salary_k"), filters.get("max_monthly_salary_k"))
+        if all(bound is None for bound in (*daily, *monthly)):
             return None
 
         match = SALARY_FORMAT.fullmatch(salary)
         if match is None:
-            return "薪资未知，无法判断是否符合最低薪资"
+            return "薪资未知，无法判断是否符合薪资限制"
         low = Decimal(match["low"])
         high = Decimal(match["high"]) if match["high"] is not None else low
         if low <= 0 or high < low:
-            return "薪资未知，无法判断是否符合最低薪资"
+            return "薪资未知，无法判断是否符合薪资限制"
 
-        minimum, unit = (daily, "元/天") if match["daily"] else (monthly, "K")
+        bounds, unit = (daily, "元/天") if match["daily"] else (monthly, "K")
+        minimum, maximum = bounds
         if minimum is not None and low < Decimal(str(minimum)):
             return f"薪资下限 {low:g}{unit} 低于设定的 {minimum:g}{unit}"
+        if maximum is not None and high > Decimal(str(maximum)):
+            return f"薪资上限 {high:g}{unit} 高于设定的 {maximum:g}{unit}"
         return None
 
     def filter_skip_reason(self, card):

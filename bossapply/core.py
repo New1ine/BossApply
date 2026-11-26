@@ -33,6 +33,7 @@ DEFAULTS = {
         'require_exclude_enabled': False, 'require_exclude_keywords': [],
         'require_include_enabled': False, 'require_include_keywords': [],
         'min_daily_salary': 100.0, 'min_monthly_salary_k': 3.0,
+        'max_daily_salary': None, 'max_monthly_salary_k': None,
         'allow_negotiable_salary': True,
     },
 }
@@ -149,12 +150,22 @@ def normalize_config(data):
             if keyword:
                 unique.setdefault(keyword.casefold(), keyword)
         filters[keywords_key] = list(unique.values())
-    for key, field in (('min_daily_salary', '最低日薪'), ('min_monthly_salary_k', '最低月薪')):
+    for key, field in (
+        ('min_daily_salary', '最低日薪'), ('min_monthly_salary_k', '最低月薪'),
+        ('max_daily_salary', '最高日薪'), ('max_monthly_salary_k', '最高月薪'),
+    ):
         value = filters[key]
         if value is None or (isinstance(value, str) and not value.strip()):
             filters[key] = None
         else:
             filters[key] = _number(value, float, field, lambda n: n > 0)
+    for minimum_key, maximum_key, label in (
+        ('min_daily_salary', 'max_daily_salary', '日薪'),
+        ('min_monthly_salary_k', 'max_monthly_salary_k', '月薪'),
+    ):
+        minimum, maximum = filters[minimum_key], filters[maximum_key]
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise ValueError(f'最高{label}不能低于最低{label}')
     return cfg
 
 

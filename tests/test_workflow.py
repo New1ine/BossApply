@@ -151,6 +151,29 @@ class WorkflowTests(unittest.TestCase):
                 })
                 self.assertEqual(workflow.filter_skip_reason(position) is not None, skipped)
 
+    def test_salary_caps_use_the_range_maximum_in_the_salary_unit(self):
+        cases = (
+            ("250-300元/天", {"min_daily_salary": 250, "max_daily_salary": 300}, None),
+            ("250-300元/天", {"max_daily_salary": 299}, "薪资上限"),
+            ("250-300元/天", {"max_monthly_salary_k": 25}, None),
+            ("15-25K·14薪", {"max_monthly_salary_k": 25}, None),
+            ("15-25K·14薪", {"max_monthly_salary_k": 24.5}, "薪资上限"),
+            ("15-25K·14薪", {"max_daily_salary": 20}, None),
+            ("25.5K", {"max_monthly_salary_k": 25}, "薪资上限"),
+            ("25.5K", {"max_monthly_salary_k": 25.5}, None),
+            ("薪资待定", {"max_daily_salary": 300}, "薪资未知"),
+            (None, {"max_monthly_salary_k": 25}, "薪资未知"),
+        )
+        for salary, filters, skip_message in cases:
+            with self.subTest(salary=salary, filters=filters):
+                workflow = self.workflow(FakeAdb(), filters=filters)
+                reason = workflow.filter_skip_reason({"title": "开发工程师", "salary": salary})
+                if skip_message is None:
+                    self.assertIsNone(reason)
+                else:
+                    self.assertIsNotNone(reason)
+                    self.assertIn(skip_message, reason)
+
     def test_negotiable_salary_still_applies_keyword_filters(self):
         position = list_cards(listing(card(title="C++ 开发工程师", extra=(
             '<node resource-id="tv_salary_statue" text="面议" bounds="[320,220][490,250]"/>'
@@ -165,11 +188,11 @@ class WorkflowTests(unittest.TestCase):
         position = list_cards(listing(card(extra=(
             '<node resource-id="tv_salary_statue" text="面议" bounds="[320,220][490,250]"/>'
         ))))[0]
-        for minimum in (None, 200):
+        for bounds in ({}, {"min_daily_salary": 200}, {"max_daily_salary": 300}):
             for allowed in (True, False):
-                with self.subTest(minimum=minimum, allowed=allowed):
+                with self.subTest(bounds=bounds, allowed=allowed):
                     workflow = self.workflow(FakeAdb(), filters={
-                        "allow_negotiable_salary": allowed, "min_daily_salary": minimum,
+                        "allow_negotiable_salary": allowed, **bounds,
                     })
                     reason = workflow.filter_skip_reason(position)
                     if allowed:
