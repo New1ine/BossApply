@@ -115,13 +115,39 @@ class WorkflowTests(unittest.TestCase):
             ({"require_exclude_enabled": True, "require_exclude_keywords": ["c++"]}, True),
             ({"include_enabled": True, "include_keywords": ["c++"]}, True),
             ({"require_include_enabled": True, "require_include_keywords": ["c++"]}, False),
-            ({"include_enabled": True, "include_keywords": ["嵌入式"],
-              "require_include_enabled": True, "require_include_keywords": ["Rust"]}, True),
+            ({"require_include_enabled": True, "require_include_keywords": ["嵌入式"]}, True),
         )
         for filters, skipped in cases:
             with self.subTest(filters=filters):
                 workflow = self.workflow(FakeAdb(), filters=filters)
                 self.assertEqual(workflow.filter_skip_reason(embedded) is not None, skipped)
+
+    def test_either_positive_keyword_filter_can_match(self):
+        workflow = self.workflow(FakeAdb(), filters={
+            "include_enabled": True, "include_keywords": ["嵌入式"],
+            "require_include_enabled": True, "require_include_keywords": ["C++"],
+            "exclude_enabled": True, "exclude_keywords": ["实习"],
+            "require_exclude_enabled": True, "require_exclude_keywords": ["外包"],
+            "max_monthly_salary_k": 25,
+        })
+        cases = (
+            ("软件开发", ["C++"], "15-25K", None),
+            ("嵌入式开发", ["Rust"], "15-25K", None),
+            ("软件开发", ["Rust"], "15-25K", "岗位名称和岗位要求未命中正向关键词"),
+            ("软件开发实习", ["C++"], "15-25K", "岗位名称命中反向关键词"),
+            ("嵌入式开发", ["外包"], "15-25K", "岗位要求命中反向关键词"),
+            ("软件开发", ["C++"], "15-26K", "薪资上限"),
+        )
+        for title, requirements, salary, skip_message in cases:
+            with self.subTest(title=title, requirements=requirements, salary=salary):
+                reason = workflow.filter_skip_reason({
+                    "title": title, "requirements": requirements, "salary": salary,
+                })
+                if skip_message is None:
+                    self.assertIsNone(reason)
+                else:
+                    self.assertIsNotNone(reason)
+                    self.assertIn(skip_message, reason)
 
     def test_salary_filter_uses_the_salary_field_unit_and_range_minimum(self):
         cases = (

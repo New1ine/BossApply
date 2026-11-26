@@ -443,17 +443,21 @@ class Workflow:
     def keyword_skip_reason(self, card):
         filters = self.cfg.get("filters", {})
         values = ((card["title"],), card.get("requirements", ()))
-        missing_include = None
+        include_labels = []
+        include_matched = False
         for (prefix, label), texts in zip(KEYWORD_SCOPES, values):
             if filters.get(f"{prefix}exclude_enabled"):
                 matched = matching_keyword(filters.get(f"{prefix}exclude_keywords", []), texts)
                 if matched is not None:
                     return f"{label}命中反向关键词「{matched}」"
-            if filters.get(f"{prefix}include_enabled") and matching_keyword(
-                filters.get(f"{prefix}include_keywords", []), texts
-            ) is None:
-                missing_include = missing_include or f"{label}未命中正向关键词"
-        return missing_include
+            if filters.get(f"{prefix}include_enabled"):
+                include_labels.append(label)
+                include_matched = include_matched or matching_keyword(
+                    filters.get(f"{prefix}include_keywords", []), texts
+                ) is not None
+        if include_labels and not include_matched:
+            return f"{'和'.join(include_labels)}未命中正向关键词"
+        return None
 
     def salary_skip_reason(self, card):
         filters = self.cfg.get("filters", {})
