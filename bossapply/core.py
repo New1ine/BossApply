@@ -7,13 +7,15 @@ import sys
 import tempfile
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from contextlib import nullcontext
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import PROJECT_ROOT
 from .delivery_stats import DailyDeliveryStats, DeliveryStatsError
 from .engine.adb_client import AdbClient
-from .engine.workflow import DeliveryCheckpoint, Workflow
+from .engine.ui_probe import ComponentReader
+from .engine.workflow import TIMING_DEFAULTS, DeliveryCheckpoint, Workflow
 
 BASE_DIR = (
     Path(os.environ.get("APPDATA") or Path.home()) / "BossApply"
@@ -23,8 +25,9 @@ BASE_DIR = (
 CONFIG_PATH = BASE_DIR / "config.json"
 DELIVERY_STATS_PATH = BASE_DIR / "delivery_stats.sqlite3"
 DEFAULTS = {
-    'device': {'path': 'auto', 'port': 0, 'serial': 'auto', 'click_interval': 0.15},
+    'device': {'path': 'auto', 'port': 0, 'serial': 'auto', 'click_interval': 0, 'ui_reader': 'command'},
     'run': {'limit': 100, 'timeout': 18, 'scroll_fraction': 0.145, 'max_scroll_attempts': 20},
+    'timing': TIMING_DEFAULTS.copy(),
     'actions': {'image': False, 'quick_phrase': False},
     'image': {'album': 'My Documents', 'indices': [1], 'original': True},
     'filters': {
@@ -88,6 +91,10 @@ def normalize_config(data):
         raise ValueError('配置必须是 JSON 对象')
     cfg = copy.deepcopy(DEFAULTS)
     for section, values in data.items():
+        if section == 'timing':
+            # Earlier versions persisted tuning values, including obsolete or
+            # invalid ones. Timing is now an internal policy, not user input.
+            continue
         if section in cfg:
             if not isinstance(values, dict):
                 raise ValueError(f'配置段 {section} 必须是 JSON 对象')
@@ -96,15 +103,20 @@ def normalize_config(data):
             cfg[section] = copy.deepcopy(values)
 
     device = cfg['device']
+    old_target = device.pop('target', None)
+    old_serial = device['serial']
+    if old_target == 'emulator' or (isinstance(old_serial, str) and old_serial.strip().startswith('emulator-')):
+        device.update(path='auto', port=0, serial='auto')
+    if device['ui_reader'] not in ('command', 'component'):
+        raise ValueError('控件读取方式必须是 ADB 命令或手机组件')
     run = cfg['run']
     image = cfg['image']
     run['limit'] = normalize_delivery_target(run['limit'])
+    device['click_interval'] = 0
+    for key in ('timeout', 'scroll_fraction', 'max_scroll_attempts'):
+        run[key] = DEFAULTS['run'][key]
     numeric_fields = (
         (device, 'port', int, 'ADB 端口（0～65535）', lambda n: 0 <= n <= 65535),
-        (device, 'click_interval', float, '操作后停顿（0～5 秒）', lambda n: 0 <= n <= 5),
-        (run, 'timeout', int, '页面等待上限（3～120 秒）', lambda n: 3 <= n <= 120),
-        (run, 'scroll_fraction', float, '短滑屏幕比例（大于 0 且小于 1）', lambda n: 0 < n < 1),
-        (run, 'max_scroll_attempts', int, '最大短滑次数（1～100）', lambda n: 1 <= n <= 100),
     )
     for section, key, convert, field, valid in numeric_fields:
         section[key] = _number(section[key], convert, field, valid)
@@ -121,6 +133,7 @@ def normalize_config(data):
     cfg['actions']['image'] = _boolean(cfg['actions']['image'], '发送图片')
     cfg['actions']['quick_phrase'] = _boolean(cfg['actions']['quick_phrase'], '发送快捷语')
     image['original'] = _boolean(image['original'], '发送原图')
+    image.pop('reuse_album_navigation', None)
     if 'index' in image:
         legacy_index = image.pop('index')
         if 'indices' not in data['image']:
@@ -263,9 +276,12 @@ class Controller:
                 self.state['device'] = f'{serial} · {adb.port}'
             if resuming:
                 self.log('正在继续本次投递任务')
-            self.log('手机已连接：' + serial + ' · 端口 ' + str(adb.port))
-            Workflow(adb, cfg, log=self.log, progress=self.progress,
-                     checkpoint=task.checkpoint, resuming=resuming).run()
+            self.log(f'手机已连接：{serial} · 端口 {adb.port}')
+            use_component = device_cfg['ui_reader'] == 'component'
+            self.log('控件读取方式：' + ('手机组件' if use_component else 'ADB 命令'))
+            with ComponentReader(adb) if use_component else nullcontext():
+                Workflow(adb, cfg, log=self.log, progress=self.progress,
+                         checkpoint=task.checkpoint, resuming=resuming).run()
         except InterruptedError:
             self.log('已停止')
             result = 'stopped'
@@ -305,11 +321,20 @@ class Controller:
                 return False
             return self._start_worker(_DeliveryTask(cfg), resuming=False)
 
-    def resume(self):
+    def resume(self, reader_settings=None, *, reader_device=None):
         with self.lock:
             if not self.state['can_resume']:
                 return False
-            return self._start_worker(self.task, resuming=True)
+            task = self.task
+            if reader_settings is not None:
+                config = copy.deepcopy(task.config)
+                device = config['device']
+                original_device = task.device or (device['serial'], device['port'])
+                changes = reader_settings.get('device', {})
+                if reader_device in (None, original_device) and 'ui_reader' in changes:
+                    device['ui_reader'] = changes['ui_reader']
+                task = replace(task, config=normalize_config(config))
+            return self._start_worker(task, resuming=True)
 
     def halt(self):
         with self.lock:

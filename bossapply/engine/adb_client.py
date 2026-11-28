@@ -1,9 +1,11 @@
 """ADB interaction layer. No GUI dependencies."""
 import hashlib
 import ipaddress
+import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import string
@@ -29,8 +31,17 @@ class TransientUiDumpError(UiDumpError):
     """这次抓取没有取得快照，可在原操作的时限内重新抓取。"""
 
 
+class ComponentUiTransition(TransientUiDumpError):
+    """组件在页面变化时放弃了这次快照。"""
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__('正在等待 BOSS 界面稳定')
+
+
 class AdbClient:
     DEFAULT_PORTS = tuple(range(5037, 5057))
+    MISSING_DEVICE_MESSAGE = '没有找到已授权的手机，请检查 USB 或 WiFi 调试连接'
     WINDOWS_ADB_FILES = ('adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll')
     WIFI_PAIRING_SERVICE = '_adb-tls-pairing._tcp'
     WIFI_CONNECT_SERVICE = '_adb-tls-connect._tcp'
@@ -45,8 +56,10 @@ class AdbClient:
         if not 0 <= self.port <= 65535:
             raise ValueError('ADB 端口必须在 0～65535 之间')
         self.serial = str(config.get('serial', 'auto'))
-        self.interval = float(config.get('click_interval', 0.15))
+        self.interval = float(config.get('click_interval', 0))
         self.size = (1240, 2772)
+        self.ui_reader = None
+        self._command_gesture_selection = None
         self.paired_endpoint = None
         self.paired_guid = None
 
@@ -120,7 +133,8 @@ class AdbClient:
         except (OSError, TimeoutError):
             return False
 
-    def _run_for_port(self, port, *args, timeout=5, merge_output=False, input_data=None):
+    def _run_for_port(self, port, *args, timeout=5, merge_output=False, input_data=None,
+                      cancel_on_stdin_close=False):
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         env = None
         if sys.platform.startswith('linux') and getattr(sys, 'frozen', False):
@@ -130,23 +144,32 @@ class AdbClient:
             else:
                 env.pop('LD_LIBRARY_PATH', None)
 
+        if cancel_on_stdin_close and input_data is not None:
+            raise ValueError('受控输入通道不能同时发送命令输入')
         self.check_stop()
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         try:
             proc = subprocess.Popen(
                 [self.path, '-P', str(port), *args],
-                stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
+                stdin=subprocess.PIPE if input_data is not None or cancel_on_stdin_close else subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags, env=env,
             )
         except FileNotFoundError as exc:
             raise RuntimeError('找不到 ADB，请安装 Platform-Tools 或检查 ADB 路径') from exc
+        # communicate() normally closes stdin immediately. A gesture instead owns
+        # this pipe until completion; EOF tells the phone to CANCEL before exit.
+        control = proc.stdin if cancel_on_stdin_close else None
+        if control is not None:
+            proc.stdin = None
         try:
             while True:
                 self.check_stop()
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
                     raise AdbTimeoutError(f'ADB 命令超时（{timeout} 秒）')
-                poll = min(0.2, remaining) if self.stopped is not None else remaining
+                poll = remaining
+                if self.stopped is not None:
+                    poll = 0.2 if remaining is None else min(0.2, remaining)
                 try:
                     stdout, stderr = proc.communicate(input=input_data, timeout=poll)
                     break
@@ -154,8 +177,21 @@ class AdbClient:
                     input_data = None  # communicate() retains any pending input.
             self.check_stop()
         except BaseException:
-            self._terminate_client(proc)
+            if control is not None:
+                try:
+                    control.close()
+                    proc.communicate(timeout=1)
+                except (OSError, subprocess.TimeoutExpired):
+                    self._terminate_client(proc)
+            else:
+                self._terminate_client(proc)
             raise
+        finally:
+            if control is not None:
+                try:
+                    control.close()
+                except OSError:
+                    pass  # Preserve an existing command failure if the pipe broke.
         if proc.returncode:
             detail = (stderr or stdout).decode('utf-8', errors='replace').strip()
             raise RuntimeError('ADB 执行失败：' + (detail or str(proc.returncode)))
@@ -271,20 +307,20 @@ class AdbClient:
         return servers
 
     def discover_devices(self):
-        """List connected phones without dumping their UI or selecting one."""
+        """List authorized phones without selecting one."""
         return [(server['port'], dev) for server in self._discover_servers()
                 for dev in server['devices'] if dev['physical']]
 
     def connect(self):
-        """Find the requested authorized phone, over USB or WiFi."""
+        """Connect to a unique authorized phone over USB or WiFi."""
+        self._command_gesture_selection = None
         auto = self.serial in ('', 'auto')
-        matches = [(server['port'], device['serial']) for server in self._discover_servers()
-                   for device in server['devices']
-                   if (device['physical'] if auto else device['serial'] == self.serial)]
+        matches = [(port, device['serial']) for port, device in self.discover_devices()
+                   if auto or device['serial'] == self.serial]
         if not matches:
             if auto:
-                raise RuntimeError('没有找到已授权的手机，请检查 USB 或 WiFi 调试连接')
-            raise RuntimeError('找不到指定手机：' + self.serial)
+                raise RuntimeError(self.MISSING_DEVICE_MESSAGE)
+            raise RuntimeError(f'找不到指定手机：{self.serial}')
         if len(matches) > 1:
             raise RuntimeError('发现多个匹配的手机连接，请明确选择手机和 ADB 端口')
         port, serial = matches[0]
@@ -468,15 +504,103 @@ class AdbClient:
             time.sleep(delay)
         self.check_stop()
 
-    def tap(self, x, y):
+    def tap(self, x, y, *, settle=None):
         self.shell('input', 'tap', str(int(x)), str(int(y)))
-        self.wait()
+        self.wait(settle)
 
-    def back(self):
+    def back(self, *, settle=None):
         self.shell('input', 'keyevent', '4')
-        self.wait()
+        self.wait(settle)
 
-    def swipe_short(self, fraction=0.145, duration=200, *, bounds=None):
+    def swipe(self, x1, y1, x2, y2, *, duration=600):
+        values = (x1, y1, x2, y2, duration)
+        if any(type(value) is not int for value in values) or not 50 <= duration <= 5000:
+            raise ValueError('滑动坐标必须是整数，手势时长须在 50～5000 毫秒内')
+        width, height = self.size
+        if not (0 <= x1 < width and 0 <= x2 < width and 0 <= y1 < height and 0 <= y2 < height):
+            raise ValueError('滑动坐标超出当前屏幕')
+        if (x1, y1) == (x2, y2):
+            raise ValueError('滑动起点与终点相同')
+        self.check_stop()
+        if self.ui_reader is not None:
+            return self.ui_reader.swipe(x1, y1, x2, y2, duration)
+        return self._command_swipe(x1, y1, x2, y2, duration)
+
+    @staticmethod
+    def _scroll_gesture_path():
+        if getattr(sys, 'frozen', False):
+            candidates = (
+                Path(sys._MEIPASS) / 'android-probe' / 'ScrollGesture.jar',
+                Path(sys.executable).resolve().parent / 'BossApplyScrollGesture.jar',
+            )
+        else:
+            candidates = (PROJECT_ROOT / 'build' / 'android' / 'BossApplyScrollGesture.jar',)
+        for path in candidates:
+            if path.is_file():
+                return path
+        raise RuntimeError('找不到匀速拖动工具，请重新构建 BossApplyScrollGesture.jar 或使用手机组件')
+
+    @staticmethod
+    def _matches_scroll_digest(output, digest, remote):
+        return output.split() == [digest.encode('ascii'), remote.encode('ascii')]
+
+    def _cached_scroll_gesture(self):
+        jar = self._scroll_gesture_path()
+        digest = hashlib.sha256(jar.read_bytes()).hexdigest()
+        remote = f'/data/local/tmp/bossapply-scroll-{digest}.jar'
+        quoted_remote = shlex.quote(remote)
+        cached = self.shell(f'if [ -f {quoted_remote} ]; then sha256sum {quoted_remote}; fi', timeout=5)
+        if self._matches_scroll_digest(cached, digest, remote):
+            return remote
+
+        # Each publisher owns its temporary file. Only verified complete bytes
+        # become the shared cache entry, through a same-directory atomic rename.
+        temporary = f'{remote}.{secrets.token_hex(16)}.part'
+        quoted_temporary = shlex.quote(temporary)
+        cleanup = AdbClient({'path': self.path, 'port': self.port, 'serial': self.serial})
+        try:
+            self.run('-s', self.serial, 'push', str(jar), temporary, timeout=10)
+            published = self.shell(
+                f'scroll_sha=$(sha256sum {quoted_temporary}) && '
+                f'[ "${{scroll_sha%% *}}" = {shlex.quote(digest)} ] && '
+                f'mv -f -- {quoted_temporary} {quoted_remote} && sha256sum {quoted_remote}', timeout=10,
+            )
+            if not self._matches_scroll_digest(published, digest, remote):
+                raise RuntimeError('手机滑动工具缓存未通过 SHA256 校验，已停止；未发送手势')
+            return remote
+        except BaseException:
+            # Use an uncancelled transport, and never remove the shared cache:
+            # another task may already be using that complete verified JAR.
+            try:
+                cleanup.shell('rm', '-f', '--', temporary, timeout=3)
+            except (OSError, RuntimeError):
+                pass  # Preserve the deployment error, including stop and disconnect.
+            raise
+
+    def _command_swipe(self, x1, y1, x2, y2, duration):
+        key = (self.serial, self.port)
+        if self._command_gesture_selection is None or self._command_gesture_selection[0] != key:
+            # APK reuse launches only app_process; never start a second
+            # instrumentation session beside the command reader's uiautomator.
+            from .ui_probe import command_gesture_path
+            self._command_gesture_selection = (key, command_gesture_path(self))
+        remote = self._command_gesture_selection[1]
+        if remote is None:
+            remote = self._cached_scroll_gesture()
+        command = (f'CLASSPATH={shlex.quote(remote)} app_process / com.bossapply.scrolltest.ScrollGesture '
+                   f'{x1} {y1} {x2} {y2} {duration} 150 --monitor-stdin')
+        raw = self._run_for_port(self.port, '-s', self.serial, 'shell', '-T', command,
+                                 timeout=duration / 1000 + 5, cancel_on_stdin_close=True)
+        try:
+            result = json.loads(raw)
+        except (ValueError, TypeError, UnicodeDecodeError) as exc:
+            raise RuntimeError('匀速拖动结果无法确认，已停止；不会重复发送手势') from exc
+        if (not isinstance(result, dict) or result.get('ok') is not True
+                or result.get('protocol') != 1 or result.get('profile') != 'uniform'):
+            raise RuntimeError('匀速拖动未确认成功，请更新拖动工具；不会重复发送手势')
+        return result
+
+    def swipe_short(self, fraction=0.145, duration=200, *, bounds=None, settle=None):
         left, top, right, bottom = (0, 0, *self.size) if bounds is None else bounds
         height = bottom - top
         if left < 0 or top < 0 or left >= right or height < 2:
@@ -484,10 +608,14 @@ class AdbClient:
         x = (left + right) // 2
         start = min(top + round(height * 0.65), bottom - 1)
         end = max(top, int(start - height * float(fraction)))
-        self.shell('input', 'swipe', str(x), str(start), str(x), str(end), str(duration))
-        self.wait()
+        result = self.swipe(x, start, x, end, duration=int(duration))
+        if settle is not None:
+            self.wait(settle)
+        return result
 
-    def dump_ui(self, timeout=30):
+    def dump_ui(self, timeout=30, *, wait_for_scroll=False):
+        if self.ui_reader is not None:
+            return self._parse_ui(self.ui_reader.read(timeout, wait_for_scroll=wait_for_scroll))
         # Use one ADB round trip and a fresh file in the shell-only directory.
         command = (
             f'umask 077; tmp=/data/local/tmp/bossapply-{secrets.token_hex(16)}.xml; '
@@ -514,7 +642,11 @@ class AdbClient:
             }):
                 raise TransientUiDumpError(f'无法读取手机界面：{exc}') from exc
             raise UiDumpError(f'无法读取手机界面：{exc}') from exc
-        if len(raw) > self.MAX_UI_DUMP_BYTES:
+        return self._parse_ui(raw)
+
+    @classmethod
+    def _parse_ui(cls, raw):
+        if len(raw) > cls.MAX_UI_DUMP_BYTES:
             raise UiDumpError('手机界面数据超过允许的大小')
         try:
             document = raw.decode('utf-8-sig')

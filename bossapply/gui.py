@@ -21,8 +21,11 @@ if sys.stderr is None:
 
 import customtkinter as ctk
 
-from .core import CONTROLLER, normalize_config, normalize_delivery_target, read_config, write_config
+from .core import (
+    CONTROLLER, normalize_config, normalize_delivery_target, read_config, write_config,
+)
 from .engine.adb_client import AdbClient
+from .engine.ui_probe import component_available, install_probe, uninstall_probe
 
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
@@ -36,6 +39,10 @@ TEXT = "#162033"
 MUTED = "#4B5563"
 ACCENT = "#2563EB"
 BORDER = "#E5E9F0"
+PROBE_ACTIONS = {
+    'probe_install': ("安装组件", "正在安装手机组件…", "已安装手机组件", install_probe),
+    'probe_uninstall': ("卸载组件", "正在卸载手机组件…", "所选手机已卸载组件", uninstall_probe),
+}
 
 
 class TagEditor(ctk.CTkFrame):
@@ -142,6 +149,8 @@ class Desktop(ctk.CTk):
         self.closing = False
         self.advanced_open = False
         self.wifi_open = False
+        self.probe_open = False
+        self._automatic_reader_device = None
         self._last_log_count = 0
         self._last_logs = []
         self._last_result = "idle"
@@ -190,6 +199,25 @@ class Desktop(ctk.CTk):
             ctk.CTkLabel(field, text=suffix, text_color=MUTED).pack(side="left", padx=(6, 0))
         return var
 
+    def _probe_controls(self, parent):
+        self.probe_btn = ctk.CTkButton(parent, text="手机组件  ▸", height=30, anchor="w",
+                                       fg_color="transparent", hover_color="#EBF0F9",
+                                       text_color=MUTED, command=self._toggle_probe)
+        self.probe_btn.pack(fill="x", padx=12, pady=(0, 2))
+        self.probe_box = ctk.CTkFrame(parent, fg_color="transparent")
+        actions = ctk.CTkFrame(self.probe_box, fg_color="transparent")
+        actions.pack(fill="x", pady=(3, 6))
+        self.probe_actions = {}
+        for kind, (title, *_) in PROBE_ACTIONS.items():
+            control = ctk.CTkButton(actions, text=title, width=94, height=32,
+                                    fg_color="#EAF1FF", hover_color="#D9E7FF", text_color=ACCENT,
+                                    command=lambda action=kind: self._run_probe_action(action))
+            control.pack(side="left", padx=(0, 8))
+            self.probe_actions[kind] = control
+        ctk.CTkLabel(self.probe_box, text="操作适用于所选手机。「安装组件」也可更新已安装的版本。",
+                     text_color=MUTED, font=ctk.CTkFont(size=13), anchor="w",
+                     justify="left", wraplength=590).pack(fill="x")
+
     def _init_ui(self):
         # Scrollable center keeps the window useful on small displays.
         shell = ctk.CTkFrame(self, fg_color="transparent")
@@ -209,10 +237,12 @@ class Desktop(ctk.CTk):
         self.device_menu = ctk.CTkOptionMenu(dev, values=["请先检测或连接手机"], height=36,
                                               fg_color="#F2F5FA", button_color="#E6ECF5",
                                               button_hover_color="#D5DDEB", text_color=TEXT,
-                                              dropdown_fg_color=WHITE, dropdown_text_color=TEXT)
+                                              dropdown_fg_color=WHITE, dropdown_text_color=TEXT,
+                                              command=self._check_device_component)
         self.device_menu.pack(fill="x", padx=18, pady=(0, 15))
         self.status = ctk.CTkLabel(dev, text="", text_color=MUTED, font=ctk.CTkFont(size=13),
                                    anchor="w")
+        self._probe_controls(dev)
 
         self.wifi_btn = ctk.CTkButton(dev, text="WiFi 调试  ▸", height=30, anchor="w",
                                       fg_color="transparent", hover_color="#EBF0F9",
@@ -344,23 +374,29 @@ class Desktop(ctk.CTk):
                                           text_color=MUTED, command=self._toggle_advanced)
         self.advanced_btn.pack(fill="x", pady=(0, 8))
         self.advanced_box = self._card(content)
-        self._header(self.advanced_box, "速度与设备参数")
-        speed = ctk.CTkFrame(self.advanced_box, fg_color="transparent")
-        speed.pack(fill="x", padx=(18, 6), pady=(0, 5))
-        self.delay = self._entry(speed, "操作后停顿（秒）")
-        self.timeout = self._entry(speed, "等待页面出现上限（秒）")
+        self._header(self.advanced_box, "控件读取方式")
+        readers = ctk.CTkFrame(self.advanced_box, fg_color="transparent")
+        readers.pack(fill="x", padx=18, pady=(0, 5))
+        self.ui_reader = tk.StringVar(master=readers)
+        self.reader_buttons = []
+        for value, title in (("command", "ADB 命令"), ("component", "手机组件")):
+            button = ctk.CTkRadioButton(readers, text=title, value=value, variable=self.ui_reader,
+                                        height=24, text_color=TEXT, fg_color=ACCENT,
+                                        command=self._choose_reader_manually)
+            button.pack(side="left", padx=(0, 18))
+            self.reader_buttons.append(button)
+        ctk.CTkLabel(self.advanced_box, text="连接手机时自动检测可用组件，也可在这里手动切换。",
+                     text_color=MUTED, font=ctk.CTkFont(size=13),
+                     justify="left").pack(anchor="w", padx=18, pady=(0, 4))
         ctk.CTkLabel(self.advanced_box,
-                     text="操作后停顿用于等待界面响应；页面正常出现时不会等满超时上限。",
+                     text="程序根据页面状态和列表可用区域自动控制等待与滑动。",
                      text_color=MUTED, font=ctk.CTkFont(size=13),
                      wraplength=600, justify="left").pack(anchor="w", padx=18, pady=(0, 11))
-        adv1 = ctk.CTkFrame(self.advanced_box, fg_color="transparent")
-        adv1.pack(fill="x", padx=(18, 6), pady=(0, 11))
-        self.port = self._entry(adv1, "ADB 端口（0 = 自动）")
-        self.adb_path = self._entry(adv1, "ADB 路径（auto = 自动查找）")
-        adv2 = ctk.CTkFrame(self.advanced_box, fg_color="transparent")
-        adv2.pack(fill="x", padx=(18, 6), pady=(0, 15))
-        self.scroll = self._entry(adv2, "短滑屏幕比例")
-        self.scroll_attempts = self._entry(adv2, "最大短滑次数")
+        self._header(self.advanced_box, "ADB 连接")
+        adb_fields = ctk.CTkFrame(self.advanced_box, fg_color="transparent")
+        adb_fields.pack(fill="x", padx=(18, 6), pady=(0, 15))
+        self.port = self._entry(adb_fields, "ADB 端口（0 = 自动）")
+        self.adb_path = self._entry(adb_fields, "ADB 路径（auto = 自动查找）")
         self.advanced_box.pack_forget()
 
         actions = ctk.CTkFrame(content, fg_color="transparent")
@@ -405,12 +441,11 @@ class Desktop(ctk.CTk):
 
     def _load(self):
         c = self.cfg
+        self.ui_reader.set(c['device']['ui_reader'])
         for variable, value in (
-            (self.limit, c['run']['limit']), (self.delay, c['device']['click_interval']),
-            (self.timeout, c['run']['timeout']), (self.album, c['image']['album']),
+            (self.limit, c['run']['limit']), (self.album, c['image']['album']),
             (self.port, c['device']['port']),
-            (self.adb_path, c['device']['path']), (self.scroll, c['run']['scroll_fraction']),
-            (self.scroll_attempts, c['run']['max_scroll_attempts']),
+            (self.adb_path, c['device']['path']),
         ):
             variable.set(str(value))
         for key, variable in self.salary_fields.items():
@@ -455,10 +490,25 @@ class Desktop(ctk.CTk):
             self.wifi_box.pack_forget()
         self.wifi_btn.configure(text="WiFi 调试  ▾" if opened else "WiFi 调试  ▸")
 
+    def _toggle_probe(self):
+        self.probe_open = not self.probe_open
+        if self.probe_open:
+            self.probe_box.pack(fill="x", padx=18, pady=(0, 10), after=self.probe_btn)
+        else:
+            self.probe_box.pack_forget()
+        self.probe_btn.configure(text="手机组件  ▾" if self.probe_open else "手机组件  ▸")
+
     def _set_status(self, text, color=MUTED):
         self.status.configure(text=text, text_color=color)
         if not self.status.winfo_manager():
-            self.status.pack(fill="x", padx=18, pady=(0, 6), before=self.wifi_btn)
+            self.status.pack(fill="x", padx=18, pady=(0, 6), before=self.probe_btn)
+
+    def _choose_reader_manually(self):
+        self._automatic_reader_device = None
+
+    def _apply_detected_reader(self, mode):
+        self._automatic_reader_device = self.device_choices.get(self.device_menu.get())
+        self.ui_reader.set(mode)
 
     def _device_config(self):
         cfg = copy.deepcopy(self.cfg['device'])
@@ -479,7 +529,8 @@ class Desktop(ctk.CTk):
     def _update_controls(self, state):
         busy = self.closing or self.device_operation is not None or state['running']
         can_resume = not busy and state['can_resume']
-        controls = (busy, self.device_operation, state['running'], state['stopping'], can_resume)
+        probe_ready = not busy and self.device_menu.get() in self.device_choices
+        controls = (busy, self.device_operation, state['running'], state['stopping'], can_resume, probe_ready)
         if controls == self._last_controls:
             return
         self._last_controls = controls
@@ -489,6 +540,11 @@ class Desktop(ctk.CTk):
             control.configure(state=mode)
         self.resume_btn.configure(state='normal' if can_resume else 'disabled')
         self.stop_btn.configure(state='normal' if state['running'] and not state['stopping'] else 'disabled')
+        for control in self.probe_actions.values():
+            control.configure(state='normal' if probe_ready else 'disabled')
+        updating_reader = self.device_operation in ('probe_check', *PROBE_ACTIONS)
+        for control in self.reader_buttons:
+            control.configure(state='disabled' if updating_reader else 'normal')
 
     def _start_device_job(self, kind, cfg, status, job):
         state = CONTROLLER.snapshot()
@@ -516,6 +572,46 @@ class Desktop(ctk.CTk):
             self.events.put((kind, source, None, err))
             return False
         return True
+
+    def _check_device_component(self, _choice=None):
+        try:
+            cfg = self._device_config()
+        except ValueError:
+            return False
+        selection = self._selected_device(cfg)
+        if selection is None:
+            return False
+        cfg['serial'], cfg['port'] = selection
+
+        def job(adb, _cancelled):
+            adb.connect()
+            return component_available(adb)
+
+        return self._start_device_job('probe_check', cfg, "正在检测手机组件…", job)
+
+    def _run_probe_action(self, kind):
+        if self.closing or self.device_operation is not None or CONTROLLER.snapshot()['running']:
+            return
+        title, status, _, action = PROBE_ACTIONS[kind]
+        try:
+            cfg = self._device_config()
+        except ValueError as err:
+            messagebox.showwarning(title, str(err), parent=self)
+            return
+        selection = self._selected_device(cfg)
+        if selection is None:
+            messagebox.showwarning(title, "请使用当前 ADB 路径和端口检测或连接手机，再选择设备", parent=self)
+            return
+        if kind == 'probe_uninstall' and not messagebox.askyesno(
+                title, f"从以下手机卸载 BossApply 手机组件？\n\n{self.device_menu.get()}", parent=self):
+            return
+        cfg['serial'], cfg['port'] = selection
+
+        def job(adb, _cancelled):
+            adb.connect()
+            action(adb)
+
+        self._start_device_job(kind, cfg, status, job)
 
     def start_qr_pairing(self):
         try:
@@ -591,18 +687,21 @@ class Desktop(ctk.CTk):
 
         self._start_device_job('connect', cfg, "正在连接 WiFi 手机…", job)
 
+    def _reader_settings(self):
+        return {'device': {'ui_reader': self.ui_reader.get()}}
+
     def _make_config(self):
         cfg = copy.deepcopy(self.cfg)
-        cfg['run'].update(limit=self.limit.get(), timeout=self.timeout.get(),
-                          scroll_fraction=self.scroll.get(), max_scroll_attempts=self.scroll_attempts.get())
         device = self._device_config()
         selection = self._selected_device(device)
         if selection is not None:
             device['serial'] = selection[0]
         elif self._device_source(device) == self._device_source(self.cfg['device']):
             device['serial'] = self.cfg['device']['serial']
-        device['click_interval'] = self.delay.get()
         cfg['device'] = device
+        cfg['run']['limit'] = self.limit.get()
+        for section, values in self._reader_settings().items():
+            cfg[section].update(values)
         cfg['actions']['image'] = bool(self.image_enabled.get())
         cfg['actions']['quick_phrase'] = False
         if cfg['actions']['image']:
@@ -647,7 +746,7 @@ class Desktop(ctk.CTk):
                 for port, dev in adb.discover_devices()
             }
             if not devices:
-                raise RuntimeError("没有找到已授权的手机，请检查 USB 或 WiFi 调试连接")
+                raise RuntimeError(AdbClient.MISSING_DEVICE_MESSAGE)
             return devices, preferred
 
         self._start_device_job('scan', device_cfg, "正在检测设备…", job)
@@ -686,7 +785,7 @@ class Desktop(ctk.CTk):
         if self.closing or self.device_operation is not None:
             return
         try:
-            resumed = CONTROLLER.resume()
+            resumed = CONTROLLER.resume(self._reader_settings(), reader_device=self._automatic_reader_device)
         except (ValueError, RuntimeError) as err:
             messagebox.showerror("无法继续投递", str(err), parent=self)
             return
@@ -716,6 +815,24 @@ class Desktop(ctk.CTk):
             self._hide_qr()
         if self.closing:
             return
+        if kind == 'probe_check':
+            self._apply_detected_reader('component' if result else 'command')
+            if error is not None:
+                self._set_status("无法检测手机组件，使用 ADB 命令")
+            elif result:
+                self._set_status("检测到可用手机组件，已选用手机组件", "#188264")
+            else:
+                self._set_status("所选手机无可用组件，使用 ADB 命令", "#188264")
+            return
+        if kind in PROBE_ACTIONS:
+            title, _, status, _ = PROBE_ACTIONS[kind]
+            if error is None:
+                self._apply_detected_reader('component' if kind == 'probe_install' else 'command')
+                self._set_status(status, "#188264")
+            else:
+                self._set_status(f"{title}失败", "#C24141")
+                messagebox.showwarning(title, str(error), parent=self)
+            return
         if cancelled:
             self._set_status("已取消扫码配对")
             return
@@ -737,7 +854,8 @@ class Desktop(ctk.CTk):
                 elif len(devices) == 1:
                     selected = next(iter(devices))
             self._show_devices(source, devices, selected)
-            self._set_status(f"已检测到 {len(devices)} 台设备", "#188264")
+            if selected is None or not self._check_device_component():
+                self._set_status(f"已检测到 {len(devices)} 台设备", "#188264")
             return
 
         serial, port, warning = result
@@ -754,7 +872,8 @@ class Desktop(ctk.CTk):
                     f"Android · {serial}  (ADB {port})")
         devices[name] = device
         self._show_devices(source, devices, name)
-        self._set_status(f"WiFi 已连接 · {serial}", "#188264")
+        if not self._check_device_component():
+            self._set_status(f"WiFi 已连接 · {serial}", "#188264")
 
     def _update_logs(self, state):
         log_count = state['log_count']
@@ -818,12 +937,13 @@ class Desktop(ctk.CTk):
     def _close(self):
         self.closing = True
         CONTROLLER.halt()
-        if self.device_cancel is not None:
+        changing_probe = self.device_operation in PROBE_ACTIONS
+        if self.device_cancel is not None and not changing_probe:
             self.device_cancel.set()
         state = CONTROLLER.snapshot()
         if state['running'] or self.device_operation is not None:
             self._update_controls(state)
-            self._set_status("正在停止操作并关闭…")
+            self._set_status("等待组件操作完成后关闭…" if changing_probe else "正在停止操作并关闭…")
         else:
             self.destroy()
 

@@ -22,6 +22,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_missing_config_uses_defaults_without_creating_a_file(self):
         cfg = core.read_config()
+        self.assertNotIn('target', cfg['device'])
         self.assertFalse(cfg['actions']['image'])
         self.assertEqual(cfg['image']['indices'], [1])
         self.assertEqual(cfg['run']['limit'], 100)
@@ -54,6 +55,45 @@ class ConfigTests(unittest.TestCase):
         core.write_config(cfg)
         self.assertEqual(core.read_config(), cfg)
 
+    def test_legacy_device_settings_migrate_to_phone_only(self):
+        for serial in ('auto', 'ABC123', '192.168.1.5:37123'):
+            with self.subTest(serial=serial):
+                core.write_config({'device': {'target': 'phone', 'port': 5038, 'serial': serial}})
+                self.assertEqual(core.read_config()['device'], {
+                    'path': 'auto', 'port': 5038, 'serial': serial, 'click_interval': 0, 'ui_reader': 'command',
+                })
+        for legacy in ({'target': 'emulator'}, {'serial': 'emulator-5554'}):
+            with self.subTest(legacy=legacy):
+                core.write_config({'device': {
+                    **legacy, 'path': 'local-sdk/adb.exe', 'port': 5047, 'click_interval': 0.08,
+                }})
+                self.assertEqual(core.read_config()['device'], {
+                    'path': 'auto', 'port': 0, 'serial': 'auto', 'click_interval': 0, 'ui_reader': 'command',
+                })
+
+    def test_legacy_timing_settings_cannot_override_internal_policy(self):
+        core.write_config({'timing': {
+            'ui_dump_retry_delay': '0', 'ui_dump_timeout': '9.5',
+            'poll_interval': None, 'job_swipe_duration': '250', 'album_swipe_duration': '450',
+        }})
+        self.assertEqual(core.read_config()['timing'], core.DEFAULTS['timing'])
+
+    def test_invalid_legacy_runtime_tuning_does_not_block_business_settings(self):
+        for timing in (None, [], 'obsolete', {'ui_dump_timeout': 0, 'poll_interval': 'NaN'}):
+            with self.subTest(timing=timing):
+                core.write_config({
+                    'device': {'click_interval': float('nan')},
+                    'run': {'limit': 7, 'timeout': 'invalid', 'scroll_fraction': None,
+                            'max_scroll_attempts': -1},
+                    'timing': timing,
+                    'filters': {'require_include_keywords': ['RTOS']},
+                })
+                cfg = core.read_config()
+                self.assertEqual(cfg['device']['click_interval'], 0)
+                self.assertEqual(cfg['run'], {**core.DEFAULTS['run'], 'limit': 7})
+                self.assertEqual(cfg['timing'], core.DEFAULTS['timing'])
+                self.assertEqual(cfg['filters']['require_include_keywords'], ['RTOS'])
+
     def test_delivery_target_clamps_whole_numbers_and_saves_the_result(self):
         cases = (
             (-10, 1), ('0', 1), ('001', 1), ('37', 37), (150, 150), ('9999', 150),
@@ -71,6 +111,28 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(core.read_config()['image'], {
             'album': 'My Documents', 'indices': [3, 1], 'original': True,
         })
+
+    def test_removed_navigation_and_step_settings_are_discarded_from_old_configs(self):
+        self.path.write_text('''{
+            "actions": {"image": true},
+            "device": {"click_interval": 0.5},
+            "image": {"indices": [3], "reuse_album_navigation": true},
+            "timing": {"screenshot_timeout": 2, "screenshot_interval": 0.1,
+                       "screenshot_attempts": 3, "foreground_timeout": 1,
+                       "chat_timeout": 7, "chat_settle": 0.08, "poll_interval": 0.2}
+        }''', encoding='utf-8')
+        cfg = core.read_config()
+        self.assertTrue(cfg['actions']['image'])
+        self.assertEqual(cfg['device']['click_interval'], 0)
+        self.assertEqual(cfg['image']['indices'], [3])
+        self.assertNotIn('reuse_album_navigation', cfg['image'])
+        self.assertEqual(set(cfg['timing']), set(core.DEFAULTS['timing']))
+        self.assertEqual(cfg['timing']['poll_interval'], core.DEFAULTS['timing']['poll_interval'])
+        core.write_config(cfg)
+        content = self.path.read_text(encoding='utf-8')
+        self.assertNotIn('screenshot', content)
+        self.assertNotIn('chat_timeout', content)
+        self.assertNotIn('chat_settle', content)
 
     def test_empty_photo_selection_defaults_to_first_photo(self):
         self.path.write_text('{"actions":{"image":true},"image":{"indices":[]}}', encoding='utf-8')
@@ -115,7 +177,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_invalid_config_is_rejected_without_modifying_original(self):
         malformed = (
-            b'{', b'[]', b'{"run":null}', b'{"device":{"click_interval":NaN}}',
+            b'{', b'[]', b'{"run":null}',
+            b'{"device":{"ui_reader":"unknown"}}',
             b'{"actions":{"image":"yes"}}', b'{"filters":{"exclude_keywords":"Python"}}',
             b'{"filters":{"include_keywords":[null]}}', b'\xff',
             b'{"image":{"index":null}}', b'{"image":{"indices":2}}',
@@ -210,6 +273,45 @@ class ControllerTests(unittest.TestCase):
                     controller.thread.join(2)
         self.assertEqual(controller.snapshot()['result'], 'stopped')
         self.assertFalse(controller.snapshot()['running'])
+
+    def test_resume_switches_reader_without_changing_runtime_policy_or_business_settings(self):
+        controller = core.Controller()
+        task = core._DeliveryTask(core.normalize_config({
+            'device': {'serial': 'phone'}, 'run': {'limit': 5}, 'image': {'indices': [3]},
+        }), device=('phone', 5037))
+        task.checkpoint.success = 2
+        controller.task = task
+        controller.state['can_resume'] = True
+        with patch.object(controller, '_start_worker', return_value=True) as start_worker:
+            self.assertTrue(controller.resume({
+                'device': {'serial': 'different-phone', 'click_interval': '0.07', 'ui_reader': 'component'},
+                'run': {'limit': 50, 'scroll_fraction': '0.2'},
+                'image': {'indices': [1]},
+                'timing': {'poll_interval': '0.25'},
+            }))
+        resumed = start_worker.call_args.args[0]
+        self.assertEqual(start_worker.call_args.kwargs, {'resuming': True})
+        self.assertIs(resumed.checkpoint, task.checkpoint)
+        self.assertEqual(resumed.device, task.device)
+        self.assertEqual(resumed.config['device']['serial'], 'phone')
+        self.assertEqual(resumed.config['device']['click_interval'], 0)
+        self.assertEqual(resumed.config['device']['ui_reader'], 'component')
+        self.assertEqual(resumed.config['run']['limit'], 5)
+        self.assertEqual(resumed.config['run']['scroll_fraction'], core.DEFAULTS['run']['scroll_fraction'])
+        self.assertEqual(resumed.config['image']['indices'], [3])
+        self.assertEqual(resumed.config['timing'], core.DEFAULTS['timing'])
+        self.assertEqual(task.config['timing']['poll_interval'], core.DEFAULTS['timing']['poll_interval'])
+
+    def test_resume_does_not_use_a_reader_detected_on_another_phone(self):
+        controller = core.Controller()
+        controller.task = core._DeliveryTask(core.normalize_config({}), device=('original-phone', 5037))
+        controller.state['can_resume'] = True
+        with patch.object(controller, '_start_worker', return_value=True) as start_worker:
+            self.assertTrue(controller.resume({'device': {'ui_reader': 'component', 'click_interval': 0.5}},
+                                              reader_device=('another-phone', 5037)))
+        options = start_worker.call_args.args[0].config['device']
+        self.assertEqual(options['ui_reader'], 'command')
+        self.assertEqual(options['click_interval'], 0)
 
     def test_confirmed_deliveries_persist_through_error_and_another_run(self):
         def first_run(config, *, progress, **_callbacks):

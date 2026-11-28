@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 from xml.etree import ElementTree
 
 from bossapply import core
-from bossapply.engine.adb_client import AdbTimeoutError, TransientUiDumpError, UiDumpError
+from bossapply.engine.adb_client import AdbTimeoutError, ComponentUiTransition, TransientUiDumpError, UiDumpError
 from bossapply.engine.uixml import list_cards
 from bossapply.engine.workflow import BOSS_PACKAGE, UiTimeoutError, Workflow
 
@@ -34,6 +34,14 @@ def listing(contents):
     return screen(f'<node resource-id="rv_list" bounds="[0,100][500,900]">{contents}</node>')
 
 
+def album_navigation_pages():
+    return (
+        screen('<node resource-id="mTextView" text="图片" bounds="[20,700][100,780]"/>'),
+        screen('<node resource-id="mGalleryTextView" bounds="[150,650][350,730]"/>'),
+        screen('<node resource-id="tv_title" text="所有媒体" bounds="[100,100][300,200]"/>'),
+    )
+
+
 def quota_reminder(message="您今天已与120位BOSS沟通，还剩30次沟通机会哦", *, enabled="true"):
     return screen(
         '<node resource-id="tv_title" text="温馨提示" bounds="[50,350][450,400]"/>'
@@ -48,15 +56,20 @@ def quota_reminder(message="您今天已与120位BOSS沟通，还剩30次沟通�
 class FakeAdb:
     def __init__(self, *pages):
         self.pages = deque(pages)
+        self.size = (500, 1000)
         self.now = 0
         self.back_calls = 0
         self.scroll_calls = 0
         self.scroll_bounds = []
         self.taps = []
+        self.gesture_settles = []
         self.dump_timeouts = []
+        self.dump_scroll_waits = []
+        self.swipes = []
 
-    def dump_ui(self, *, timeout):
+    def dump_ui(self, *, timeout, wait_for_scroll=False):
         self.dump_timeouts.append(timeout)
+        self.dump_scroll_waits.append(wait_for_scroll)
         page = self.pages[0]
         if len(self.pages) > 1:
             self.pages.popleft()
@@ -72,15 +85,25 @@ class FakeAdb:
     def check_stop(self):
         pass
 
-    def back(self):
+    def back(self, *, settle=None):
         self.back_calls += 1
+        self.gesture_settles.append(settle)
+        self.now += settle or 0
 
-    def swipe_short(self, _fraction, duration=200, *, bounds=None):
+    def swipe_short(self, _fraction, duration=200, *, bounds=None, settle=None):
         self.scroll_calls += 1
         self.scroll_bounds.append(bounds)
+        self.gesture_settles.append(settle)
+        self.now += settle or 0
 
-    def tap(self, x, y):
+    def swipe(self, x1, y1, x2, y2, *, duration):
+        self.scroll_calls += 1
+        self.swipes.append((x1, y1, x2, y2, duration))
+
+    def tap(self, x, y, *, settle=None):
         self.taps.append((x, y))
+        self.gesture_settles.append(settle)
+        self.now += settle or 0
 
 
 class WorkflowTests(unittest.TestCase):
@@ -278,6 +301,77 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(adb.dump_timeouts, [1.0])
         self.assertEqual(adb.now, 1.0)
 
+    def test_page_timeout_and_xml_polling_settings_limit_the_wait(self):
+        adb = FakeAdb(TransientUiDumpError("Killed"), AdbTimeoutError("Slow"))
+        workflow = self.workflow(adb, run={"timeout": 0.7}, timing={
+            "ui_dump_timeout": 0.3,
+            "ui_dump_retry_delay": 0.05, "poll_interval": 0.1,
+        })
+        with (patch.object(adb, "wait", wraps=adb.wait) as wait,
+              self.assertRaisesRegex(UiTimeoutError, "聊天输入框")):
+            workflow.wait_node("聊天输入框", id="editText_with_scrollbar", step="chat")
+
+        self.assertEqual(len(adb.dump_timeouts), 4)
+        for actual, expected in zip(adb.dump_timeouts, (0.3, 0.3, 0.3, 0.05)):
+            self.assertAlmostEqual(actual, expected)
+        # Each slow dump already exceeds the polling interval. Only the
+        # transient-error backoff consumes additional waiting time.
+        self.assertEqual([call.args for call in wait.call_args_list], [(0.05,)])
+        self.assertAlmostEqual(adb.now, 0.7)
+
+    def test_component_does_not_start_a_read_with_less_than_its_observed_budget(self):
+        adb = FakeAdb(screen(""))
+        workflow = self.workflow(adb, device={"ui_reader": "component"}, run={"timeout": .11})
+        original_dump = adb.dump_ui
+
+        def dump_ui(*, timeout, wait_for_scroll=False):
+            adb.now += .03
+            return original_dump(timeout=timeout, wait_for_scroll=wait_for_scroll)
+
+        with (patch.object(adb, "dump_ui", side_effect=dump_ui),
+              self.assertRaisesRegex(UiTimeoutError, "未出现的控件")):
+            workflow.wait_node("未出现的控件", id="missing")
+
+        self.assertEqual(len(adb.dump_timeouts), 2)
+        self.assertTrue(all(timeout >= .04 for timeout in adb.dump_timeouts))
+        self.assertLess(adb.now, workflow.timeout)
+
+    def test_component_read_exhausting_page_budget_uses_the_scroll_timeout_handler(self):
+        partial = listing(card(bounds="[0,800][500,900]"))
+        adb = FakeAdb(partial)
+        workflow = self.workflow(adb, device={"ui_reader": "component"}, run={"timeout": .05})
+        original_dump = adb.dump_ui
+
+        def dump_ui(*, timeout, wait_for_scroll=False):
+            if adb.scroll_calls:
+                adb.dump_timeouts.append(timeout)
+                adb.now += timeout
+                raise UiDumpError("手机组件读取超时") from TimeoutError()
+            return original_dump(timeout=timeout, wait_for_scroll=wait_for_scroll)
+
+        with (patch.object(adb, "dump_ui", side_effect=dump_ui),
+              self.assertRaises(UiTimeoutError)):
+            workflow.next_card()
+
+        self.assertEqual(adb.scroll_calls, 1)
+        self.assertLess(workflow.checkpoint.scroll_scale, 1)
+        self.assertEqual(adb.taps, [])
+
+    def test_component_does_not_mask_connection_or_early_read_failures_as_page_timeouts(self):
+        for cause, consumes_deadline in ((ConnectionError(), True), (TimeoutError(), False)):
+            with self.subTest(cause=type(cause).__name__):
+                adb = FakeAdb(screen(""))
+                workflow = self.workflow(adb, device={"ui_reader": "component"})
+
+                def dump_ui(*, timeout, wait_for_scroll=False):
+                    if consumes_deadline:
+                        adb.now += timeout
+                    raise UiDumpError("组件读取失败") from cause
+
+                with (patch.object(adb, "dump_ui", side_effect=dump_ui),
+                      self.assertRaisesRegex(UiDumpError, "组件读取失败")):
+                    workflow.wait_job_list()
+
     def test_retries_transient_dump_error_during_recovery_without_extra_back(self):
         jobs = listing(card())
         adb = FakeAdb(TransientUiDumpError("Killed"), jobs)
@@ -287,6 +381,34 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(adb.back_calls, 1)
         self.assertEqual(len(adb.dump_timeouts), 2)
         workflow.log.assert_called_once_with("手机界面抓取暂时失败，正在重试：Killed")
+
+    def test_chat_recovery_reads_details_before_backing_out_of_them(self):
+        detail = screen('<node resource-id="btn_chat" text="继续沟通" bounds="[100,900][500,990]"/>')
+        adb = FakeAdb(detail, detail, listing(card()))
+        workflow = self.workflow(adb)
+        original_dump = adb.dump_ui
+        backs_after_each_read = []
+
+        def dump_ui(*, timeout):
+            backs_after_each_read.append(adb.back_calls)
+            return original_dump(timeout=timeout)
+
+        with patch.object(adb, "dump_ui", side_effect=dump_ui):
+            cards = workflow.recover_to_list({"key": ("开发工程师", "测试公司")}, from_chat=True)
+
+        self.assertEqual(cards[0]["title"], "开发工程师")
+        self.assertEqual(adb.back_calls, 2)
+        self.assertEqual(backs_after_each_read, [1, 2, 2])
+
+    def test_chat_recovery_checks_the_list_anchor_after_leaving_details(self):
+        detail = screen('<node resource-id="btn_chat" text="继续沟通" bounds="[100,900][500,990]"/>')
+        adb = FakeAdb(detail, listing(card(title="其他职位")))
+        workflow = self.workflow(adb)
+        with self.assertRaisesRegex(RuntimeError, "职位列表已变化"):
+            workflow.recover_to_list({"key": ("开发工程师", "测试公司")}, from_chat=True)
+
+        self.assertEqual(adb.back_calls, 2)
+        self.assertEqual(len(adb.dump_timeouts), 3)
 
     def test_transient_dump_failure_has_a_bounded_retry_budget(self):
         adb = FakeAdb(TransientUiDumpError("Killed"))
@@ -305,6 +427,323 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(adb.dump_timeouts, [0.2])
         self.assertEqual(adb.now, 0)
 
+    def test_component_retries_at_its_own_rate_and_waits_for_stable_attachment(self):
+        moving = screen('<node resource-id="mMoreIcon" enabled="true" bounds="[30,50][90,110]"/>')
+        final = screen('<node resource-id="mMoreIcon" enabled="true" bounds="[60,80][120,140]"/>')
+        final.set("window-id", "2")
+        old_window = ElementTree.fromstring(ElementTree.tostring(final))
+        old_window.set("window-id", "1")
+        failure = TransientUiDumpError("控件树仍在变化")
+        adb = FakeAdb(failure, failure, failure, failure, moving, old_window, final, final)
+        workflow = self.workflow(adb, device={"ui_reader": "component"}, timing={"poll_interval": 0.5})
+        workflow.open_attachment_menu()
+        self.assertEqual(adb.taps, [(90, 110)])
+        self.assertEqual(adb.gesture_settles, [0])
+        self.assertEqual(len(adb.dump_timeouts), 8)
+        self.assertAlmostEqual(adb.now, 0.28)
+        workflow.log.assert_called_once_with("手机界面抓取暂时失败，正在重试：控件树仍在变化")
+
+    def test_component_does_not_guess_a_missing_attachment_position(self):
+        adb = FakeAdb(screen('<node resource-id="editText_with_scrollbar" bounds="[0,900][500,990]"/>'))
+        workflow = self.workflow(adb, device={"ui_reader": "component"})
+        with self.assertRaisesRegex(UiTimeoutError, "聊天附件按钮"):
+            workflow.open_attachment_menu()
+        self.assertEqual(adb.taps, [])
+
+    def test_component_verifies_the_position_before_opening_and_greeting(self):
+        original = listing(card(bounds="[0,160][500,410]"))
+        settled = listing(card(bounds="[0,200][500,450]"))
+        moving_button = screen('<node resource-id="btn_chat" text="立即沟通" bounds="[40,820][480,910]"/>')
+        ready_button = screen('<node resource-id="btn_chat" text="立即沟通" bounds="[50,900][490,990]"/>')
+        chat = screen('<node resource-id="editText_with_scrollbar" bounds="[0,900][500,990]"/>')
+        adb = FakeAdb(original, settled, settled, moving_button, ready_button, ready_button, chat, chat)
+        workflow = self.workflow(adb, device={"ui_reader": "component"})
+
+        self.assertTrue(workflow.apply_one(list_cards(original)[0]))
+        self.assertEqual(adb.taps, [(250, 325), (270, 945)])
+        self.assertEqual(adb.gesture_settles, [0, 0])
+
+    def test_component_does_not_repeat_back_on_lingering_or_unrecognized_screen(self):
+        chat = screen('<node resource-id="editText_with_scrollbar" bounds="[0,900][500,990]"/>')
+        adb = FakeAdb(chat, chat, chat, screen(""), listing(card()))
+        workflow = self.workflow(adb, device={"ui_reader": "component"})
+        cards = workflow.recover_to_list({"key": ("开发工程师", "测试公司")}, from_chat=True)
+        self.assertEqual(cards[0]["title"], "开发工程师")
+        self.assertEqual(adb.back_calls, 1)
+        self.assertEqual(adb.gesture_settles, [0])
+
+    def test_recovery_waits_for_loading_and_stable_filter_fields_before_reusing_cards(self):
+        first = card()
+        next_card = card(title="下一职位", bounds="[0,450][500,720]")
+        loading = listing(first + next_card +
+                          '<node class="android.widget.ProgressBar" bounds="[220,800][280,860]"/>')
+        first_ready = listing(first + next_card)
+        ready = listing(first + card(title="下一职位", bounds="[0,450][500,720]", extra=(
+            '<node resource-id="tv_salary_statue" text="8-12K" bounds="[300,470][450,500]"/>'
+        )))
+        old = list_cards(ready)[0]
+        for reader in ("command", "component"):
+            with self.subTest(reader=reader):
+                adb = FakeAdb(loading, first_ready, ready, ready)
+                workflow = self.workflow(adb, device={"ui_reader": reader},
+                                         filters={"min_monthly_salary_k": 4})
+                workflow.record_card(old, False)
+                returned = workflow.recover_to_list(old, from_chat=True)
+                selected, _ = workflow.next_card(returned)
+
+                self.assertEqual(selected["title"], "下一职位")
+                self.assertEqual(selected["salary"], "8-12K")
+                self.assertIsNone(workflow.filter_skip_reason(selected))
+                self.assertEqual(len(adb.dump_timeouts), 4)
+                self.assertEqual(adb.back_calls, 1)
+                self.assertEqual(adb.taps, [])
+                self.assertEqual(adb.scroll_calls, 0)
+                self.assertLess(workflow.checkpoint.scroll_scale, 1)
+
+    def test_component_recovery_stabilizes_filter_fields_even_without_a_loading_signal(self):
+        first = listing(card())
+        ready = listing(card(extra='<node resource-id="tv_salary_statue" text="8-12K" '
+                                   'bounds="[300,220][450,250]"/>'))
+        adb = FakeAdb(first, ready, ready)
+        workflow = self.workflow(adb, device={"ui_reader": "component"})
+        returned = workflow.recover_to_list(list_cards(first)[0])
+        self.assertEqual(returned[0]["salary"], "8-12K")
+        self.assertEqual(len(adb.dump_timeouts), 3)
+        self.assertEqual(adb.back_calls, 0)
+
+    def test_recovery_does_not_reuse_cards_when_the_list_reports_a_loading_error(self):
+        failed = listing(card() + '<node resource-id="load_error" text="加载失败，点击重试" '
+                                 'bounds="[100,800][400,870]"/>')
+        for reader in ("command", "component"):
+            with self.subTest(reader=reader):
+                adb = FakeAdb(failed)
+                workflow = self.workflow(adb, device={"ui_reader": reader})
+                with self.assertRaisesRegex(UiTimeoutError, "加载失败"):
+                    workflow.recover_to_list(list_cards(failed)[0])
+                self.assertEqual(adb.back_calls, 0)
+                self.assertEqual(adb.taps, [])
+
+    def test_component_uses_consecutive_stable_cards_instead_of_old_empty_or_moving_swipe_snapshots(self):
+        partial = listing(card(title="稳定职位", bounds="[0,60][500,180]"))
+        moving = listing(card(title="稳定职位", bounds="[0,160][500,420]"))
+        settled = listing(card(title="稳定职位"))
+        adb = FakeAdb(partial, partial, listing(""), moving, settled, settled)
+        workflow = self.workflow(adb, device={"ui_reader": "component"})
+        chosen, _ = workflow.next_card()
+        self.assertEqual(chosen["title"], "稳定职位")
+        self.assertEqual(adb.scroll_calls, 1)
+        self.assertEqual(adb.dump_scroll_waits, [False, True, True, True, True, True])
+
+    def test_component_requires_stable_filter_fields_and_scroll_sequence_after_a_swipe(self):
+        partial = listing(card(title="待检查职位", bounds="[0,60][500,180]"))
+        loading = listing(card(title="待检查职位"))
+        ready = listing(card(title="待检查职位", extra=(
+            '<node resource-id="tv_salary_statue" text="4-7K" bounds="[100,230][220,250]"/>'
+        )))
+        loading.set("scroll-sequence", "1")
+        ready.set("scroll-sequence", "2")
+        adb = FakeAdb(partial, loading, ready, ready)
+        workflow = self.workflow(adb, device={"ui_reader": "component"})
+        chosen, _ = workflow.next_card()
+        self.assertEqual(chosen["salary"], "4-7K")
+        self.assertEqual(len(adb.dump_timeouts), 4)
+
+    def test_unread_card_lost_after_scrolling_stops_before_selecting_another_job(self):
+        partial = listing(
+            '<node clickable="true" bounds="[0,800][500,900]">'
+            '<node resource-id="tv_position_name" text="未读底部职位" bounds="[10,810][300,840]"/>'
+            '<node resource-id="tv_company_name" text="测试公司" bounds="[10,850][300,880]"/>'
+            '</node>'
+        )
+        unrelated = listing(card(title="另一页的职位"))
+        for reader in ("command", "component"):
+            with self.subTest(reader=reader):
+                adb = FakeAdb(partial, unrelated, unrelated)
+                workflow = self.workflow(adb, device={"ui_reader": reader})
+                with self.assertRaisesRegex(RuntimeError, "未能确认待检查的职位卡"):
+                    workflow.next_card()
+                self.assertEqual(adb.scroll_calls, 1)
+                self.assertEqual(adb.taps, [])
+                self.assertEqual(workflow.checkpoint.processed, set())
+                self.assertEqual(workflow.checkpoint.used, 0)
+
+    def test_component_waits_for_later_jobs_after_one_swipe_without_repeated_gestures(self):
+        jobs = listing(card())
+        new_jobs = listing(card(title="延后出现的职位"))
+        adb = FakeAdb(jobs)
+        workflow = self.workflow(adb, device={"ui_reader": "component"}, run={"timeout": 1, "max_scroll_attempts": 20})
+        workflow.record_card(list_cards(jobs)[0], None)
+        original_dump = adb.dump_ui
+
+        def dump_ui(*, timeout, wait_for_scroll=False):
+            root = original_dump(timeout=timeout, wait_for_scroll=wait_for_scroll)
+            return new_jobs if adb.now >= .4 else root
+
+        with patch.object(adb, "dump_ui", side_effect=dump_ui):
+            chosen, _ = workflow.next_card()
+
+        self.assertEqual(chosen["title"], "延后出现的职位")
+        self.assertEqual(adb.scroll_calls, 1)
+        self.assertGreaterEqual(adb.now, .4)
+        self.assertLess(adb.now, 1)
+
+    def test_unknown_unchanged_list_waits_then_pauses_after_only_one_gesture(self):
+        for reader in ("command", "component"):
+            with self.subTest(reader=reader):
+                jobs = listing(card())
+                adb = FakeAdb(jobs)
+                workflow = self.workflow(adb, device={"ui_reader": reader},
+                                         run={"timeout": .5, "max_scroll_attempts": 20})
+                workflow.record_card(list_cards(jobs)[0], False)
+                with self.assertRaisesRegex(UiTimeoutError, "暂无明显进展"):
+                    workflow.next_card()
+                self.assertEqual(adb.scroll_calls, 1)
+                self.assertEqual(adb.taps, [])
+                self.assertLessEqual(.5 - adb.now, .04)
+                self.assertLessEqual(adb.now, .5)
+                self.assertFalse(workflow._job_list_end)
+
+    def test_tiny_eight_pixel_progress_waits_instead_of_issuing_another_drag(self):
+        jobs = listing(card())
+        barely_moved = listing(
+            '<node clickable="true" bounds="[0,192][500,442]">'
+            '<node resource-id="tv_position_name" text="开发工程师" bounds="[10,212][150,242]"/>'
+            '<node resource-id="tv_company_name" text="测试公司" bounds="[10,252][150,282]"/>'
+            '</node>'
+        )
+        adb = FakeAdb(jobs, barely_moved)
+        workflow = self.workflow(adb, device={"ui_reader": "component"},
+                                 run={"timeout": .5, "max_scroll_attempts": 20})
+        workflow.record_card(list_cards(jobs)[0], False)
+        with self.assertRaisesRegex(UiTimeoutError, "暂无明显进展"):
+            workflow.next_card()
+        self.assertEqual(adb.scroll_calls, 1)
+        self.assertEqual(adb.taps, [])
+        self.assertLessEqual(.5 - adb.now, .04)
+        self.assertLessEqual(adb.now, .5)
+
+    def test_loading_cards_are_not_selected_until_post_loading_snapshots_agree(self):
+        loading = listing(card() + '<node class="android.widget.ProgressBar" bounds="[220,800][280,860]"/>')
+        first_ready = listing(card())
+        ready = listing(card(extra='<node resource-id="tv_salary_statue" text="4-7K" bounds="[300,220][450,250]"/>'))
+        adb = FakeAdb(loading, first_ready, ready, ready)
+        workflow = self.workflow(adb, device={"ui_reader": "component"})
+        chosen, _ = workflow.next_card()
+        self.assertEqual(chosen["salary"], "4-7K")
+        self.assertEqual(len(adb.dump_timeouts), 4)
+        self.assertEqual(adb.scroll_calls, 0)
+        self.assertEqual(adb.taps, [])
+        self.assertLess(workflow._job_advance_scale, 1)
+
+    def test_resume_keeps_the_smaller_advance_learned_from_loading(self):
+        loading = listing(card() + '<node class="android.widget.ProgressBar" bounds="[220,800][280,860]"/>')
+        ready = listing(card())
+        adb = FakeAdb(loading, ready, ready)
+        workflow = self.workflow(adb, device={"ui_reader": "component"})
+        chosen, _ = workflow.next_card()
+        workflow.record_card(chosen, False)
+        reduced = workflow._job_advance_scale
+        self.assertLess(reduced, 1)
+
+        resumed = Workflow(adb, workflow.cfg, checkpoint=workflow.checkpoint, resuming=True)
+        self.assertEqual(resumed._job_advance_scale, reduced)
+        self.assertEqual(resumed.checkpoint.scroll_scale, reduced)
+        self.assertEqual(resumed.checkpoint.processed, {chosen["key"]})
+        self.assertEqual(resumed.checkpoint.skipped, 1)
+        self.assertEqual(Workflow(adb, workflow.cfg)._job_advance_scale, 1)
+
+    def test_loading_after_a_drag_cannot_trigger_another_drag_or_early_selection(self):
+        partial = listing(card(title="未读职位", bounds="[0,800][500,900]"))
+        loading = listing(card(title="未读职位") + '<node class="android.widget.ProgressBar" bounds="[220,800][280,860]"/>')
+        ready = listing(card(title="未读职位", extra='<node resource-id="tv_salary_statue" text="8-12K" bounds="[300,220][450,250]"/>'))
+        adb = FakeAdb(partial, loading, loading, ready, ready)
+        workflow = self.workflow(adb, device={"ui_reader": "component"})
+        chosen, _ = workflow.next_card()
+        self.assertEqual(chosen["salary"], "8-12K")
+        self.assertEqual(len(adb.dump_timeouts), 5)
+        self.assertEqual(adb.scroll_calls, 1)
+        self.assertEqual(adb.taps, [])
+
+    def test_a_temporarily_missing_unread_card_can_rebind_without_another_gesture(self):
+        partial = listing(card(title="待加载的职位", bounds="[0,800][500,900]"))
+        rebinding = listing(card(title="列表暂时只显示其他职位"))
+        ready = listing(card(title="待加载的职位"))
+        adb = FakeAdb(partial, rebinding, ready, ready)
+        workflow = self.workflow(adb, device={"ui_reader": "component"})
+        chosen, _ = workflow.next_card()
+        self.assertEqual(chosen["title"], "待加载的职位")
+        self.assertEqual(adb.scroll_calls, 1)
+        self.assertEqual(adb.taps, [])
+
+    def test_explicit_loading_error_pauses_before_selecting_or_retrying(self):
+        failed = listing(card() + '<node resource-id="load_error" text="加载失败，点击重试" bounds="[100,800][400,870]"/>')
+        adb = FakeAdb(failed)
+        workflow = self.workflow(adb)
+        with self.assertRaisesRegex(UiTimeoutError, "加载失败"):
+            workflow.next_card()
+        self.assertEqual(adb.scroll_calls, 0)
+        self.assertEqual(adb.taps, [])
+        self.assertEqual(workflow.checkpoint.processed, set())
+
+    def test_an_explicit_end_footer_can_finish_without_a_probe_gesture(self):
+        finished = listing(card() + '<node text="没有更多职位了" bounds="[100,800][400,870]"/>')
+        adb = FakeAdb(finished)
+        workflow = self.workflow(adb)
+        workflow.record_card(list_cards(finished)[0], False)
+        self.assertEqual(workflow.next_card(), (None, None))
+        self.assertEqual(adb.scroll_calls, 0)
+        self.assertTrue(workflow._job_list_end)
+
+    def test_a_complete_card_lower_in_the_viewport_is_read_without_top_alignment(self):
+        lower = listing(
+            '<node clickable="true" bounds="[0,600][500,850]">'
+            '<node resource-id="tv_position_name" text="下方完整职位" bounds="[10,620][300,660]"/>'
+            '<node resource-id="tv_company_name" text="测试公司" bounds="[10,680][300,720]"/>'
+            '</node>'
+        )
+        adb = FakeAdb(lower)
+        workflow = self.workflow(adb, device={"ui_reader": "component"})
+        chosen, _ = workflow.next_card()
+        self.assertEqual(chosen["title"], "下方完整职位")
+        self.assertEqual(adb.scroll_calls, 0)
+        self.assertEqual(adb.taps, [])
+
+    def test_next_card_prioritizes_below_the_anchor_then_checks_missed_visible_cards_above_it(self):
+        jobs = listing(card(title="尚未检查的前一职位", bounds="[0,130][500,360]")
+                       + card(title="结果待确认的锚点", bounds="[0,360][500,580]")
+                       + card(title="锚点下方职位", bounds="[0,580][500,800]"))
+        adb = FakeAdb(jobs)
+        workflow = self.workflow(adb)
+        parsed = list_cards(jobs)
+        workflow.record_card(parsed[1], None)
+        chosen, cards = workflow.next_card(parsed)
+        self.assertEqual(chosen["title"], "锚点下方职位")
+        workflow.record_card(chosen, False)
+        chosen, _ = workflow.next_card(cards)
+        self.assertEqual(chosen["title"], "尚未检查的前一职位")
+        self.assertEqual(adb.scroll_calls, 0)
+        self.assertEqual(workflow.checkpoint.unconfirmed, 1)
+
+    def test_expected_component_transition_waits_are_summarized_without_retry_error_logs(self):
+        adb = FakeAdb(ComponentUiTransition("moving"), ComponentUiTransition("changed"), listing(card()))
+        workflow = self.workflow(adb, device={"ui_reader": "component"})
+        workflow.wait_job_list()
+        workflow.log.assert_not_called()
+        workflow._report_timings(adb.now)
+        workflow.log.assert_any_call("  界面移动中　1 次")
+        workflow.log.assert_any_call("  读取期间界面变化　1 次")
+
+    def test_component_revalidates_photo_grid_before_the_next_checkbox(self):
+        thumbnail = '<node resource-id="media_thumbnail" bounds="[0,40][500,700]"/>'
+        first = '<node resource-id="check_view" bounds="[60,100][100,140]"/>'
+        grid = screen(thumbnail + first + '<node resource-id="check_view" bounds="[160,100][200,140]"/>')
+        shifted = screen(thumbnail + first + '<node resource-id="check_view" bounds="[190,100][230,140]"/>')
+        adb = FakeAdb(grid, grid, shifted, shifted)
+        workflow = self.workflow(adb, device={"ui_reader": "component"}, image={"indices": [1, 2]})
+        with self.assertRaisesRegex(RuntimeError, "缩略图位置已变化"):
+            workflow.select_image()
+        self.assertEqual(adb.taps, [(80, 120)])
+
     def test_permanent_dump_error_fails_without_retry(self):
         adb = FakeAdb(UiDumpError("device offline"))
         with self.assertRaisesRegex(UiDumpError, "offline"):
@@ -312,12 +751,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(adb.dump_timeouts), 1)
 
     def test_selects_a_complete_card_after_the_last_allowed_swipe(self):
-        empty = listing("")
-        clipped = card(title="部分可见", bounds="[0,60][500,180]")
-        adb = FakeAdb(empty, listing(clipped + card()))
-        selected = self.workflow(adb).next_card()
+        partial = listing(card(bounds="[0,60][500,180]"))
+        ready = listing(card())
+        adb = FakeAdb(partial, ready, ready)
+        selected, _ = self.workflow(adb).next_card()
         self.assertEqual(selected["title"], "开发工程师")
         self.assertEqual(adb.scroll_calls, 1)
+
+    def test_initial_empty_list_waits_for_jobs_without_swiping(self):
+        adb = FakeAdb(listing(""), listing(""), listing(card()))
+        selected, _ = self.workflow(adb).next_card()
+        self.assertEqual(selected["title"], "开发工程师")
+        self.assertEqual(adb.scroll_calls, 0)
+        self.assertEqual(len(adb.dump_timeouts), 3)
 
     def test_recovery_stops_back_navigation_as_soon_as_list_is_visible(self):
         chat = screen('<node resource-id="editText_with_scrollbar" bounds="[0,900][500,990]"/>')
@@ -325,11 +771,53 @@ class WorkflowTests(unittest.TestCase):
         self.workflow(adb).recover_to_list({"key": ("开发工程师", "测试公司")})
         self.assertEqual(adb.back_calls, 1)
 
+    def test_verified_detail_recovery_waits_for_lingering_details_after_back(self):
+        detail = screen('<node resource-id="btn_chat" text="继续沟通" bounds="[100,900][500,990]"/>')
+        adb = FakeAdb(detail, listing(card()))
+        cards = self.workflow(adb).recover_to_list({"key": ("开发工程师", "测试公司")}, from_details=True)
+        self.assertEqual(cards[0]["title"], "开发工程师")
+        self.assertEqual(adb.back_calls, 1)
+        self.assertEqual(len(adb.dump_timeouts), 2)
+
     def test_recovery_does_not_back_out_of_a_changed_list(self):
         adb = FakeAdb(listing(card(title="其他职位")))
         with self.assertRaisesRegex(RuntimeError, "职位列表已变化"):
             self.workflow(adb).recover_to_list({"key": ("开发工程师", "测试公司")})
         self.assertEqual(adb.back_calls, 0)
+
+    def test_album_navigation_reads_live_controls_on_every_visit(self):
+        pages = album_navigation_pages()
+        moved_title = screen('<node resource-id="tv_title" text="所有媒体" bounds="[140,100][340,200]"/>')
+        adb = FakeAdb(*pages, *pages[:-1], moved_title)
+        workflow = self.workflow(adb)
+        workflow.open_album_picker()
+        workflow.open_album_picker()
+
+        self.assertEqual(len(adb.dump_timeouts), 6)
+        self.assertEqual(adb.taps, [(60, 740), (250, 690), (200, 150), (60, 740), (250, 690), (240, 150)])
+
+    def test_album_navigation_rejects_a_matching_control_from_another_app(self):
+        adb = FakeAdb(screen('<node resource-id="mTextView" text="图片" bounds="[20,700][100,780]"/>',
+                             package="other.app"))
+        with self.assertRaisesRegex(RuntimeError, "手机前台不是"):
+            self.workflow(adb).open_album_picker()
+
+        self.assertEqual(adb.taps, [])
+        self.assertEqual(adb.dump_timeouts, [1.0])
+
+    def test_album_navigation_does_not_replay_a_missing_picker_control(self):
+        pages = album_navigation_pages()
+        preview = screen('<node resource-id="button_apply" text="发送" bounds="[100,100][300,200]"/>')
+        adb = FakeAdb(*pages, *pages[:-1], preview)
+        workflow = self.workflow(adb)
+        workflow.open_album_picker()
+        with (patch.object(workflow, "open_attachment_menu"),
+              patch.object(workflow, "confirm_image") as confirm,
+              self.assertRaisesRegex(UiTimeoutError, "所有媒体")):
+            workflow.send_image()
+
+        confirm.assert_not_called()
+        self.assertEqual(adb.taps, [(60, 740), (250, 690), (200, 150), (60, 740), (250, 690)])
 
     def test_album_selects_exact_name_even_if_a_prefix_match_appears_first(self):
         adb = FakeAdb(screen(
@@ -365,9 +853,18 @@ class WorkflowTests(unittest.TestCase):
             )
 
         adb = FakeAdb(album_list("Camera"), album_list("My Documents"))
-        self.workflow(adb, image={"album": "My Documents"}).select_album()
-        self.assertEqual(adb.scroll_bounds, [(40, 120, 470, 630)])
+        workflow = self.workflow(adb, image={"album": "My Documents"})
+        workflow.select_album()
+        self.assertEqual(len(adb.swipes), 1)
+        x1, y1, x2, y2, duration = adb.swipes[0]
+        self.assertEqual(x1, x2)
+        self.assertTrue(40 < x1 < 470)
+        self.assertTrue(120 < y2 < y1 < 630)
+        self.assertGreater(duration, 0)
         self.assertEqual(adb.taps, [(255, 225)])
+        messages = [entry.args[0] for entry in workflow.log.call_args_list]
+        self.assertTrue(any("My Documents" in message and "第 1/" in message for message in messages))
+        self.assertIn("耗时", messages[-1])
 
     def test_album_stops_scanning_when_visible_entries_stop_changing(self):
         adb = FakeAdb(screen(
@@ -378,6 +875,31 @@ class WorkflowTests(unittest.TestCase):
             self.workflow(adb, image={"album": "My Documents"}).select_album()
         self.assertEqual(adb.scroll_calls, 2)
         self.assertEqual(adb.taps, [])
+
+    def test_image_send_reports_stalled_picker_until_timeout(self):
+        adb = FakeAdb(AdbTimeoutError("UI dump timed out"))
+        adb.size = (500, 1000)
+        workflow = self.workflow(adb, run={"timeout": 18}, image={})
+        events = []
+        workflow.log.side_effect = events.append
+        original_dump = adb.dump_ui
+
+        def dump_ui(*, timeout):
+            events.append("dump")
+            return original_dump(timeout=timeout)
+
+        with (patch.object(adb, "dump_ui", side_effect=dump_ui),
+              self.assertRaisesRegex(UiTimeoutError, "等待超时")):
+            workflow.send_image()
+
+        first_dump = events.index("dump")
+        second_dump = events.index("dump", first_dump + 1)
+        self.assertTrue(any("附件菜单" in event for event in events[:first_dump]))
+        self.assertTrue(any("等待" in event for event in events[:first_dump]))
+        self.assertTrue(any("仍在等待" in event and "秒" in event for event in events[first_dump + 1:second_dump]))
+        self.assertRegex(events[-1], r"总耗时.*18\.0 秒")
+        self.assertEqual(len(adb.dump_timeouts), 2)
+        self.assertEqual(len(adb.taps), 1)
 
     def test_image_tags_select_visible_grid_positions_in_tag_order_and_confirm_once(self):
         grid = screen(
@@ -395,6 +917,12 @@ class WorkflowTests(unittest.TestCase):
               patch.object(workflow, "open_album_picker"), patch.object(workflow, "select_album")):
             self.assertTrue(workflow.send_image())
         self.assertEqual(adb.taps, [(80, 220), (80, 120), (400, 840), (400, 890)])
+        self.assertEqual(len(adb.dump_timeouts), 4)
+        messages = [entry.args[0] for entry in workflow.log.call_args_list]
+        self.assertTrue(any("3、1" in message for message in messages))
+        self.assertTrue(any("预览页" in message and "等待" in message for message in messages))
+        self.assertTrue(any("等待发送后返回聊天页" in message for message in messages))
+        self.assertIn("总耗时", messages[-1])
 
     def test_legacy_image_index_and_default_each_select_one_photo(self):
         grid = screen(
@@ -408,17 +936,43 @@ class WorkflowTests(unittest.TestCase):
                 self.workflow(adb, image=image).select_image()
                 self.assertEqual(adb.taps, [tap])
 
+    def test_image_send_reuses_original_on_the_photo_page_and_waits_when_unavailable(self):
+        thumbnails = (
+            '<node resource-id="media_thumbnail" bounds="[0,100][100,200]"/>'
+            '<node resource-id="check_view" bounds="[60,100][100,140]"/>'
+            '<node resource-id="check_view" bounds="[160,100][200,140]"/>'
+        )
+        original = '<node resource-id="originalLayout" enabled="{}" bounds="[40,760][140,820]"/>'
+        late_original = screen('<node resource-id="originalLayout" bounds="[160,760][260,820]"/>')
+        top = screen('<node resource-id="button_preview" text="确定（2/9）" bounds="[300,800][500,880]"/>')
+        preview = screen('<node resource-id="button_apply" text="发送（2张）" bounds="[300,850][500,930]"/>')
+        chat = screen('<node resource-id="editText_with_scrollbar" bounds="[0,950][500,990]"/>')
+        for visible in ("true", "false", None):
+            with self.subTest(visible=visible):
+                grid = screen(thumbnails + (original.format(visible) if visible is not None else ""))
+                extra_pages = () if visible == "true" else (late_original,)
+                adb = FakeAdb(grid, *extra_pages, top, preview, chat)
+                workflow = self.workflow(adb, image={"indices": [1, 2], "original": True})
+                with (patch.object(workflow, "open_attachment_menu"),
+                      patch.object(workflow, "open_album_picker"), patch.object(workflow, "select_album")):
+                    self.assertTrue(workflow.send_image())
+
+                original_point = (90, 790) if visible == "true" else (210, 790)
+                self.assertEqual(adb.taps, [(80, 120), (180, 120), original_point, (400, 840), (400, 890)])
+                self.assertEqual(len(adb.dump_timeouts), 4 + len(extra_pages))
+
     def test_image_selection_validates_all_requested_controls_before_tapping(self):
         grid = screen(
             '<node resource-id="media_thumbnail" bounds="[0,100][100,200]"/>'
             '<node resource-id="check_view" bounds="[60,100][100,140]"/>'
             '<node resource-id="check_view" enabled="false" bounds="[160,100][200,140]"/>'
+            '<node resource-id="originalLayout" bounds="[40,760][140,820]"/>'
         )
         for indices, message in (([1, 2], "第 2 张图片不可勾选"), ([1, 3], "找不到第 3 张图片")):
             with self.subTest(indices=indices):
                 adb = FakeAdb(grid)
                 with self.assertRaisesRegex(RuntimeError, message):
-                    self.workflow(adb, image={"indices": indices}).select_image()
+                    self.workflow(adb, image={"indices": indices}).select_image(include_original=True)
                 self.assertEqual(adb.taps, [])
 
     def test_multiselect_stops_before_a_confirmation_with_the_wrong_visible_count(self):
@@ -449,6 +1003,21 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(confirmed)
         self.assertEqual(adb.taps, [(400, 840), (400, 890)])
         self.assertEqual(len(adb.dump_timeouts), 6)
+
+    def test_component_waits_for_stable_top_and_send_controls(self):
+        def button(resource, text, bounds):
+            return screen(f'<node resource-id="{resource}" text="{text}" enabled="true" bounds="{bounds}"/>')
+
+        top_moving = button("button_preview", "确定", "[240,780][440,860]")
+        top_ready = button("button_preview", "确定", "[300,800][500,880]")
+        send_moving = button("button_apply", "发送", "[300,810][500,890]")
+        send_ready = button("button_apply", "发送", "[300,850][500,930]")
+        chat = screen('<node resource-id="editText_with_scrollbar" bounds="[0,950][500,990]"/>')
+        adb = FakeAdb(top_moving, top_ready, top_ready, send_moving, send_ready, send_ready, chat, chat)
+        workflow = self.workflow(adb, device={"ui_reader": "component"}, image={"original": False})
+        self.assertTrue(workflow.confirm_image())
+        self.assertEqual(adb.taps, [(400, 840), (400, 890)])
+        self.assertEqual(adb.gesture_settles, [0, 0])
 
     def test_preview_can_return_directly_to_chat_without_an_extra_click(self):
         top = screen('<node resource-id="button_preview" bounds="[300,800][500,880]"/>')
@@ -528,6 +1097,194 @@ class WorkflowTests(unittest.TestCase):
         workflow.progress.assert_called_once_with(1, "开发工程师")
         self.assertEqual(adb.taps, [(250, 325), (300, 945)])
         self.assertEqual(adb.back_calls, 1)
+        self.assertEqual(len(adb.dump_timeouts), 4)
+
+    def test_timing_summary_measures_delivery_and_its_adb_operations(self):
+        jobs = listing(card())
+        detail = screen('<node resource-id="btn_chat" text="立即沟通" bounds="[100,900][500,990]"/>')
+        chat = screen('<node resource-id="editText_with_scrollbar" bounds="[0,900][500,990]"/>')
+        album = screen('<node resource-id="album_name" text="My Documents" bounds="[0,200][500,280]"/>')
+        grid = screen(
+            '<node resource-id="media_thumbnail" bounds="[0,100][100,200]"/>'
+            '<node resource-id="check_view" bounds="[60,100][100,140]"/>'
+            '<node resource-id="originalLayout" bounds="[40,760][140,820]"/>'
+        )
+        top = screen('<node resource-id="button_preview" bounds="[300,800][500,880]"/>')
+        preview = screen('<node resource-id="button_apply" text="确定" bounds="[300,850][500,930]"/>')
+        adb = FakeAdb(jobs, detail, chat, *album_navigation_pages(), album, grid, top, preview, chat, jobs)
+        adb.size = (500, 1000)
+        workflow = self.workflow(adb, actions={"image": True}, image={})
+        original_dump, original_tap, original_back = adb.dump_ui, adb.tap, adb.back
+
+        def dump_ui(*, timeout):
+            adb.now += 0.2
+            return original_dump(timeout=timeout)
+
+        def tap(x, y, *, settle=None):
+            adb.now += 0.1
+            original_tap(x, y, settle=settle)
+
+        def back(*, settle=None):
+            adb.now += 0.3
+            original_back(settle=settle)
+
+        def record_progress(_count, _title):
+            adb.now += 0.05
+
+        workflow.progress.side_effect = record_progress
+        with (patch.object(adb, "dump_ui", side_effect=dump_ui), patch.object(adb, "tap", side_effect=tap),
+              patch.object(adb, "back", side_effect=back)):
+            workflow.run()
+
+        workflow.log.assert_any_call("本次流程耗时 3.850 秒")
+        workflow.log.assert_any_call("各步骤读取控件耗时（含失败与重试）")
+        for label, count, total, average in (
+            ("扫描职位列表", 1, "0.200", "0.200"),
+            ("打开职位详情并识别沟通按钮", 1, "0.300", "0.300"),
+            ("点击沟通并确认聊天页", 1, "0.300", "0.300"),
+            ("写入投递统计", 1, "0.050", "0.050"),
+            ("读取缩略图并勾选图片或原图", 1, "0.400", "0.400"),
+            ("等待预览并确认发送", 1, "0.300", "0.300"),
+            ("发送后等待聊天页", 1, "0.200", "0.200"),
+            ("返回并核对职位列表", 1, "0.500", "0.500"),
+            ("读取控件 XML", 12, "2.400", "0.200"),
+            ("点击（含操作停顿）", 11, "1.100", "0.100"),
+            ("职位列表", 1, "0.200", "0.200"),
+            ("打开职位详情", 1, "0.200", "0.200"),
+            ("进入聊天", 1, "0.200", "0.200"),
+            ("打开附件菜单", 1, "0.200", "0.200"),
+            ("返回职位列表", 1, "0.200", "0.200"),
+        ):
+            workflow.log.assert_any_call(f"  {label}　{count} 次，合计 {total} 秒，平均 {average} 秒，最慢 {average} 秒")
+
+    def test_workflow_uses_shared_timings_in_place_of_legacy_step_overrides(self):
+        jobs = listing(card())
+        detail = screen('<node resource-id="btn_chat" text="立即沟通" bounds="[100,900][500,990]"/>')
+        chat = screen('<node resource-id="editText_with_scrollbar" bounds="[0,900][500,990]"/>')
+        first_album_page = screen(
+            '<node scrollable="true" bounds="[40,120][470,630]">'
+            '<node resource-id="album_name" text="Camera" bounds="[0,200][500,280]"/></node>'
+        )
+        album = screen('<node resource-id="album_name" text="My Documents" bounds="[0,200][500,280]"/>')
+        grid = screen(
+            '<node resource-id="media_thumbnail" bounds="[0,100][100,200]"/>'
+            '<node resource-id="check_view" bounds="[60,100][100,140]"/>'
+        )
+        original = screen('<node resource-id="originalLayout" bounds="[40,760][140,820]"/>')
+        top = screen('<node resource-id="button_preview" bounds="[300,800][500,880]"/>')
+        preview = screen('<node resource-id="button_apply" text="确定" bounds="[300,850][500,930]"/>')
+        adb = FakeAdb(listing(""), jobs, jobs, detail, chat, *album_navigation_pages(),
+                      first_album_page, album, grid, original, top, preview, chat, jobs)
+        workflow = self.workflow(adb, actions={"image": True}, image={}, timing={
+            "job_list_timeout": 2, "job_detail_timeout": 4, "album_list_timeout": 9, "return_list_timeout": 7,
+            "job_scroll_settle": 0, "job_detail_settle": 0.1, "return_list_settle": 1.3,
+            "job_swipe_duration": 150, "album_swipe_duration": 250,
+        })
+
+        with patch.object(adb, "swipe_short", wraps=adb.swipe_short) as legacy_swipe:
+            workflow.run()
+
+        self.assertEqual(workflow.checkpoint.success, 1)
+        # Waiting through the initial empty list consumes its shared deadline;
+        # legacy per-step limits cannot extend or replace it.
+        self.assertEqual(adb.dump_timeouts[0], 1)
+        self.assertLess(adb.dump_timeouts[1], adb.dump_timeouts[0])
+        self.assertTrue(all(0 < value <= 1 for value in adb.dump_timeouts[:-1]))
+        self.assertEqual(adb.dump_timeouts[-1], 10)
+        legacy_swipe.assert_not_called()
+        self.assertEqual(len(adb.swipes), 1)
+        for (x1, y1, x2, y2, duration), (left, top, right, bottom) in zip(
+            adb.swipes, ((40, 120, 470, 630),),
+        ):
+            self.assertEqual(x1, x2)
+            self.assertTrue(left < x1 < right)
+            self.assertTrue(top < y2 < y1 < bottom)
+            self.assertGreater(duration, 0)
+            self.assertNotIn(duration, (150, 250))
+        self.assertTrue(all(settle == 0 for settle in adb.gesture_settles))
+
+    def test_timing_summary_includes_ui_retry_even_when_stopped(self):
+        adb = FakeAdb(TransientUiDumpError("Killed"), InterruptedError("已停止"))
+        workflow = self.workflow(adb)
+        original_dump = adb.dump_ui
+
+        def dump_ui(*, timeout):
+            adb.now += 0.2
+            return original_dump(timeout=timeout)
+
+        with (patch.object(adb, "dump_ui", side_effect=dump_ui), self.assertRaises(InterruptedError)):
+            workflow.run()
+
+        workflow.log.assert_any_call("本次流程耗时 0.650 秒")
+        workflow.log.assert_any_call("  扫描职位列表　1 次，合计 0.650 秒，平均 0.650 秒，最慢 0.650 秒")
+        workflow.log.assert_any_call("  读取控件 XML　2 次，合计 0.400 秒，平均 0.200 秒，最慢 0.200 秒")
+        workflow.log.assert_any_call("  轮询和重试间隔　1 次，合计 0.250 秒，平均 0.250 秒，最慢 0.250 秒")
+        workflow.log.assert_any_call("  职位列表　2 次，合计 0.400 秒，平均 0.200 秒，最慢 0.200 秒")
+
+    def test_already_contacted_job_returns_before_another_detail_read(self):
+        jobs = listing(card(title="已联系岗位") + card(title="待投岗位", bounds="[0,450][500,720]"))
+        contacted = screen('<node resource-id="btn_chat" text="继续沟通" bounds="[100,900][500,990]"/>')
+        available = screen('<node resource-id="btn_chat" text="立即沟通" bounds="[100,900][500,990]"/>')
+        chat = screen('<node resource-id="editText_with_scrollbar" bounds="[0,900][500,990]"/>')
+        adb = FakeAdb(jobs, contacted, jobs, available, chat, jobs)
+        workflow = self.workflow(adb)
+        original_dump = adb.dump_ui
+
+        def dump_ui(*, timeout):
+            if len(adb.dump_timeouts) == 2:
+                self.assertEqual(adb.back_calls, 1)
+            return original_dump(timeout=timeout)
+
+        with patch.object(adb, "dump_ui", side_effect=dump_ui):
+            workflow.run()
+
+        self.assertEqual(workflow.checkpoint.skipped, 1)
+        workflow.progress.assert_called_once_with(1, "待投岗位")
+        self.assertEqual(adb.taps, [(250, 325), (250, 585), (300, 945)])
+        self.assertEqual(adb.back_calls, 2)
+        self.assertEqual(len(adb.dump_timeouts), 6)
+
+    def test_attachment_uses_button_from_the_chat_confirmation_read(self):
+        detail = screen('<node resource-id="btn_chat" text="立即沟通" bounds="[100,900][500,990]"/>')
+        chat = screen(
+            '<node resource-id="editText_with_scrollbar" bounds="[0,900][380,990]"/>'
+            '<node resource-id="mMoreIcon" bounds="[390,910][450,940]"/>'
+        )
+        adb = FakeAdb(detail, chat)
+        adb.size = (500, 1000)
+        workflow = self.workflow(adb)
+
+        self.assertTrue(workflow.apply_one({
+            "bounds": (0, 200, 500, 450), "title": "开发工程师", "company": "测试公司",
+        }))
+        workflow.open_attachment_menu()
+
+        self.assertEqual(adb.taps, [(250, 325), (300, 945), (420, 925)])
+        self.assertEqual(len(adb.dump_timeouts), 2)
+
+    def test_list_filters_reuse_one_snapshot_before_opening_an_eligible_card(self):
+        jobs = listing(
+            card(title="实习岗位", bounds="[0,120][500,350]")
+            + card(title="低薪岗位", bounds="[0,350][500,580]", extra=(
+                '<node resource-id="tv_salary_statue" text="5-8K" bounds="[300,380][480,410]"/>'
+            ))
+            + card(bounds="[0,580][500,810]", extra=(
+                '<node resource-id="tv_salary_statue" text="10-20K" bounds="[300,610][480,640]"/>'
+            ))
+        )
+        detail = screen('<node resource-id="btn_chat" text="立即沟通" bounds="[100,900][500,990]"/>')
+        chat = screen('<node resource-id="editText_with_scrollbar" bounds="[0,900][500,990]"/>')
+        adb = FakeAdb(jobs, detail, chat, jobs)
+        workflow = self.workflow(adb, filters={
+            "exclude_enabled": True, "exclude_keywords": ["实习"], "min_monthly_salary_k": 10,
+        })
+
+        workflow.run()
+
+        workflow.progress.assert_called_once_with(1, "开发工程师")
+        self.assertEqual(workflow.checkpoint.skipped, 2)
+        self.assertEqual(adb.taps, [(250, 695), (300, 945)])
+        self.assertEqual(adb.scroll_calls, 0)
         self.assertEqual(len(adb.dump_timeouts), 4)
 
     def test_return_via_details_reuses_the_job_list_for_the_next_card(self):
